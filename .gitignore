@@ -1,0 +1,20 @@
+# 打包产物
+build/
+dist/
+计时器 v*/
+timer.exe
+
+# Python
+__pycache__/
+*.pyc
+*.spec.bak
+
+# 个人资料与配置（不上传）
+资料/
+config.ini
+config.ini.old
+FILE_INDEX.md
+
+# 编辑器
+.vscode/
+.idea/
