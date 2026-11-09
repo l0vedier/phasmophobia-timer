@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['timer.py'],
+    ['entry_timer.py'],
     pathex=[],
     binaries=[],
     datas=[('ghost_icon.ico', '.')],

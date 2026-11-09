@@ -27,11 +27,61 @@ from pynput import keyboard
 from pynput.keyboard import Key
 from pynput.mouse import Listener as MouseListener
 
-APP_TITLE = "Phasmophobia Timer"
-CONFIG_FILENAME = "config.ini"
-# 「恢复上次设置」的自动快照:1 号 = config.ini 旁边这个文件,2~5 号依次叫
-# config.prev2.ini ~ config.prev5.ini(都在用户目录里)。每次"新的一段调整"
-# 开始时五槽轮转,见 Config.save。这不是垃圾文件,别删。
+# 体力条轮询按键状态用(见 _vks_of)。显式声明类型:不写 restype 时 ctypes
+# 默认按 c_int 取返回值,GetAsyncKeyState 返回的是 SHORT。
+user32 = ctypes.windll.user32
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+
+# ======================================================================
+# 运行模式(2026-11-09 v2.7 拆分「恐鬼症工具」)
+# ----------------------------------------------------------------------
+# 同一份代码出三个成品,入口脚本(entry_*.py)在 main() 之前改 APP_MODE:
+#   both    = 二合一(恐鬼症工具),计时器 + 体力条       → tools.exe
+#   timer   = 只要计时器                                  → timer.exe
+#   stamina = 只要体力条(独立设置 / 编辑模式,无计时器) → stamina.exe
+# ⚠️ 模式是**整个进程**的属性,别在实例里各改各的;三套的配置/互斥体/标题
+# 都按下表分开,互不干扰,可以同时运行。
+# ======================================================================
+APP_MODE = "both"
+MODE_TITLES = {
+    "both": "恐鬼症工具",
+    "timer": "恐鬼症工具 · 计时器",
+    "stamina": "恐鬼症工具 · 体力条",
+}
+# 配置文件各自独立(用户 2026-11-09 定):二合一沿用老 config.ini,设置不丢;
+# 独立工具各用各的,三套可以同时开。
+MODE_CONFIG_FILES = {
+    "both": "config.ini",
+    "timer": "timer.ini",
+    "stamina": "stamina.ini",
+}
+# 互斥体也按模式分开 —— 共用一把锁的话计时器和体力条就没法同时开了。
+MODE_MUTEX = {
+    "both": "Local\\PhasmophobiaTools.SingleInstance",
+    "timer": "Local\\PhasmophobiaTools.Timer",
+    "stamina": "Local\\PhasmophobiaTools.Stamina",
+}
+
+
+def _app_mode():
+    """当前运行模式;写坏的值一律按二合一处理(开发态 `python timer.py`)。"""
+    return APP_MODE if APP_MODE in MODE_TITLES else "both"
+
+
+def _app_title():
+    return MODE_TITLES[_app_mode()]
+
+
+def _config_filename():
+    return MODE_CONFIG_FILES[_app_mode()]
+
+
+# 「恢复上次设置」的自动快照:和配置同目录、按配置名派生 —— config.ini →
+# config.prev.ini;timer.ini → timer.prev.ini;stamina.ini → stamina.prev.ini。
+# 2~5 号依次是 *.prev2.ini ~ *.prev5.ini。每次"新的一段调整"开始时五槽轮转,
+# 见 Config.save。这不是垃圾文件,别删。路径由 _prev_slot_path() 统一拼。
+CONFIG_FILENAME = "config.ini"          # 旧名字,仅二合一模式使用(见 MODE_CONFIG_FILES)
 CONFIG_PREV_FILENAME = "config.prev.ini"
 # 快照槽位数(2026-10-14 晚用户要求「记忆功能增加上限至五」):1 号最新,
 # 数字越大越老;「恢复上次设置」连点 = 一层层往回退,最多退到这里。
@@ -159,6 +209,121 @@ HOTKEY_GROUPS = [
 
 HOTKEY_LABELS = dict(HOTKEY_DESCRIPTIONS)
 
+# ---- 体力条 ----
+# 这些是**按住状态**的键,不是"按一下触发一次"的热键 —— 所以单独放 [Stamina] 节,
+# 不进 HOTKEY_DESCRIPTIONS。放进去的话捕获窗口会把 W 绑成一个小动作,
+# 万一有人把「前进」改成 F1,就会和「启用/停用计时器」抢同一个键(字典顺序决定谁赢)。
+#
+# 默认值 = 恐鬼症原版按键:WASD 移动、Shift 跑、C 蹲。
+# F7 归满 = 从这一刻起按满格重新算(不用等它自己回满)。
+# 设置窗口里能改的体力条按键 —— 只剩「归满」。
+# 2026-11-08 用户点名:WASD / Shift / C 是游戏写死的键,设了也没意义,
+# 反而容易改错,所以它们从设置面板里撤掉、写死在 STAM_FIXED_KEYS 里。
+STAMINA_KEYS = [
+    ("stam_reset", "key_reset", "归满"),
+]
+
+# 游戏里写死的移动/跑/蹲键。**不给改**,也不读配置(老配置里残留的
+# key_forward 等几行没人读了,留在文件里无害)。
+STAM_FIXED_KEYS = {
+    "key_forward": "W",
+    "key_back": "S",
+    "key_left": "A",
+    "key_right": "D",
+    "key_sprint": "SHIFT",
+    "key_crouch": "C",
+}
+
+# 改「归满」时撞上上面这几个固定键,提示里要报的中文名
+STAM_FIXED_LABELS = {
+    "key_forward": "前进 W",
+    "key_back": "后退 S",
+    "key_left": "左移 A",
+    "key_right": "右移 D",
+    "key_sprint": "跑步 Shift",
+    "key_crouch": "蹲下 C",
+}
+
+# 体力条大小(百分比)。高度/字号/两端的留白一起等比缩,存在 [Stamina] scale。
+# 长度(宽度)单独一条 [Stamina] width 控制(2026-11-09 v2.5 用户点名要能调长度),
+# 两者相乘才是最终宽度 —— 想细长就 scale 调小、width 调大。
+STAM_SCALE_MIN = 60
+STAM_SCALE_MAX = 200
+STAM_SCALE_STEP = 5
+
+STAM_WIDTH_MIN = 50
+STAM_WIDTH_MAX = 300
+STAM_WIDTH_STEP = 10
+
+# 体力模型常数。全部来自 PCStamina / PlayerStamina 反汇编(与 phasmo-footstep-dsp
+# 的 stamina_hud.py 同一套,那边有 18 项回归测试):
+#   上限 3.0;跑 -1.0/s;停跑先空转 2.0 s 再 +1.0/s;跑空力竭恢复 5.0 s 补满且不能跑。
+STAM_CAP = 3.0
+STAM_DRAIN = 1.0
+STAM_REGEN = 1.0
+STAM_REGEN_DELAY = 2.0
+STAM_WINDED_TIME = 5.0
+
+# 体力条读按键**不用 pynput 的事件**,直接轮询 GetAsyncKeyState。
+# 理由:事件流会漏 keyup —— 切窗口 / 游戏全屏抢焦点时偶发一次,「跑」那个键就
+# 永久卡在按下状态,体力条一路掉到力竭还回不来(浮窗版 stamina_hud.py 一直用
+# 轮询,没这个毛病)。事件流只留作认不出来的键名的兜底。
+_VK_GROUPS = {
+    # 修饰键左右各一个 VK,再加上通用 VK —— 三个都问一遍最稳
+    "SHIFT": (0xA0, 0xA1, 0x10),
+    "CTRL": (0xA2, 0xA3, 0x11),
+    "ALT": (0xA4, 0xA5, 0x12),
+}
+_VK_SINGLE = {
+    "SPACE": 0x20, "TAB": 0x09, "ENTER": 0x0D, "RETURN": 0x0D,
+    "ESC": 0x1B, "ESCAPE": 0x1B, "CAPS_LOCK": 0x14,
+    "UP": 0x26, "DOWN": 0x28, "LEFT": 0x25, "RIGHT": 0x27,
+    "BACKSPACE": 0x08, "DELETE": 0x2E, "INSERT": 0x2D,
+    "HOME": 0x24, "END": 0x23, "PAGE_UP": 0x21, "PAGE_DOWN": 0x22,
+    "NUM_LOCK": 0x90, "SCROLL_LOCK": 0x91, "PAUSE": 0x13,
+}
+
+# 体力条浮窗的逻辑尺寸(px)。窗口内容全是自绘,改这里就得跟着改 _draw_stamina。
+STAM_W = 220
+STAM_H = 66
+STAM_MARGIN = 20          # 自动摆到左下角时离屏幕边多远
+STAM_TICK_MS = 33         # ≈30 Hz;体力是按真实 dt 积分的,掉帧也不会漂
+
+
+def _vks_of(name):
+    """键名 → 要问的 VK 列表;认不出来返回 None。
+
+    认得出的都是轮询(可靠);认不出的("鼠标左键"这种)退回事件集合。
+    """
+    if not name:
+        return None
+    if name in _VK_GROUPS:
+        return _VK_GROUPS[name]
+    if name in _VK_SINGLE:
+        return (_VK_SINGLE[name],)
+    if len(name) == 1 and name.isascii() and name.isalnum():
+        return (ord(name.upper()),)
+    if len(name) >= 2 and name[0] == "F" and name[1:].isdigit():
+        n = int(name[1:])
+        if 1 <= n <= 24:
+            return (0x6F + n,)
+    return None
+
+
+def _spec_down(name, fallback):
+    """这个键现在按着没有。轮询优先,认不出来才查事件集合。
+
+    轮询 = GetAsyncKeyState,它读的是**物理键状态**,不管焦点在哪、
+    有没有漏掉 keyup —— 游戏全屏、切窗口、Alt+Tab 都不影响。
+    """
+    vks = _vks_of(name)
+    if vks is None:
+        return name in fallback
+    try:
+        return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in vks)
+    except Exception:
+        return name in fallback
+
 DEFAULTS = {
     "Display": {
         # 秒表**没有**自己的字号 —— 它和主计时器是同一个位置(R 键互斥切换),
@@ -189,10 +354,29 @@ DEFAULTS = {
         "pause_resume": "SPACE",
         "stopwatch_start": "T",
         "toggle_stopwatch_view": "R",
-        "close": "F5",
+        # 2026-11-09 用户点名「快速关闭用 F6」—— 他本人一直把 close 改成 F6,
+        # 现在三个工具都默认 F6,别再改回 F5(体力条工具只有这一个热键)。
+        "close": "F6",
         # 鼠标键没有修饰键,写成一个不带 `+` 的基名 —— 见 base_mouse_name()
         "click_second": "MOUSE_LEFT",
         "click_reset": "MOUSE_RIGHT",
+    },
+    "Stamina": {
+        # 1 = 显示体力条浮窗;0 = 隐藏(托盘菜单「显示体力条」改的就是这个)
+        "enabled": "1",
+        # 只有「归满」可改,写法和 [Hotkeys] 一样:F7 / CTRL+T。
+        # WASD / Shift / C 是游戏写死的,写死在 STAM_FIXED_KEYS 里,这里没有。
+        "key_reset": "F7",
+        # 大小百分比:60~200,100 = 默认(220×66)。
+        # 设置窗口「体力条大小」那行,或者编辑模式里在体力条上滚轮,都是改它。
+        "scale": "100",
+        # 长度百分比:50~300,100 = 默认宽度。只改长度,不改高度/字号。
+        # 设置窗口「体力条长度」那行改它;最终宽度 = 220 × scale × width。
+        "width": "100",
+        # 体力条位置。**留空 = 每次启动自动摆到屏幕左下角**(改分辨率也照样贴边);
+        # 在编辑模式里拖动一次就写成固定坐标,以后不再自动摆。
+        "x": "",
+        "y": "",
     },
 }
 
@@ -235,6 +419,25 @@ CONFIG_HEADER = """\
 ;         组合键写 CTRL+T / ALT+F1 / CTRL+SHIFT+R
 ;         鼠标键写 MOUSE_LEFT / MOUSE_RIGHT / MOUSE_MIDDLE / MOUSE_X1 / MOUSE_X2
 ;   留空表示不绑定该功能
+;
+; 【Stamina】体力条浮窗
+;   这是**按住不放**的键,和上面"按一下触发一次"的热键不是一回事,
+;   所以单独一节;设置窗口里也是单独一栏。
+;   W / A / S / D、Shift、C 是游戏写死的键,**不在配置里、也改不了**
+;   (写死在代码的 STAM_FIXED_KEYS 里;老配置里若还留着 key_forward 之类的行,
+;    程序已经不读了,留着无害,想删就删)。
+;   key_reset                                       归满格,并从这一刻重新算
+;   scale                                           大小百分比,60~200,100 = 默认
+;   width                                           长度百分比,50~300,100 = 默认宽度
+;                                                   (只改长度;最终宽 = 220×scale×width)
+;   x / y                                           体力条位置;留空 = 自动摆到左下角
+;                                                   (编辑模式里拖动,拖完自动写进来)
+;
+;   体力模型(全部来自游戏代码,不是估的):
+;     满格 3.0;跑步 -1.0/秒,正好跑 3 秒;
+;     停跑先空转 2.0 秒,之后 +1.0/秒;
+;     跑空进「力竭恢复」5.0 秒补满(每秒 +0.6),这段时间按 Shift 也跑不动。
+;     不考虑止痛药(那是瞬间补满 + 一段时间不扣,本工具不实现)。
 """
 
 
@@ -273,13 +476,14 @@ def _resolve_config_path():
     ⚠️ 测试脚本通过改掉 _config_dir 来隔离配置(见 timer2-dim-test)。
     返回 (路径, 是否发生了迁移)。
     """
-    path = os.path.join(_config_dir(), CONFIG_FILENAME)
+    fname = _config_filename()
+    path = os.path.join(_config_dir(), fname)
     if not os.path.exists(path):
         try:
             os.makedirs(_config_dir(), exist_ok=True)
         except OSError:
-            return os.path.join(_app_dir(), CONFIG_FILENAME), False
-        legacy = os.path.join(_app_dir(), CONFIG_FILENAME)
+            return os.path.join(_app_dir(), fname), False
+        legacy = os.path.join(_app_dir(), fname)
         if os.path.exists(legacy):
             try:
                 shutil.copyfile(legacy, path)
@@ -296,13 +500,15 @@ def _resolve_config_path():
 def _prev_slot_path(config_path, i):
     """第 i 号自动快照的路径(1 = 最新,CONFIG_PREV_SLOTS = 最老)。
 
-    1 号沿用老名字 config.prev.ini —— 老用户的单份快照无缝变成 1 号,不用迁移;
-    2~5 号依次是 config.prev2.ini ~ config.prev5.ini,都和 config.ini 同目录。
+    按配置文件名派生:config.ini → config.prev.ini(老用户的单份快照无缝变成
+    1 号);timer.ini → timer.prev.ini;stamina.ini → stamina.prev.ini。
+    2~5 号依次叫 <名字>.prev2.ini ~ .prev5.ini,都和配置同目录。
     """
     d = os.path.dirname(config_path)
+    stem = os.path.splitext(os.path.basename(config_path))[0]
     if i == 1:
-        return os.path.join(d, CONFIG_PREV_FILENAME)
-    return os.path.join(d, "config.prev{}.ini".format(i))
+        return os.path.join(d, stem + ".prev.ini")
+    return os.path.join(d, "{}.prev{}.ini".format(stem, i))
 
 
 def _resource_path(name):
@@ -354,6 +560,52 @@ def _ensure_admin():
     except Exception:
         pass
     sys.exit()
+
+
+MUTEX_NAME = MODE_MUTEX["both"]        # 兼容旧引用;实际按 _app_mode() 取
+
+
+def _single_instance_guard():
+    """同一时间只允许**同一个工具**开一个实例,防止多开。
+
+    2026-11-08 的教训:重启脚本漏关旧实例 -> 两个进程各占一个托盘图标,
+    隐藏图标面板里越堆越多。现在第二个实例直接退出,不建窗口也不建托盘
+    图标,所以不会留下任何残影。
+
+    2026-11-09 三套拆分后互斥体按模式分开(MODE_MUTEX):二合一 / 独立计时器 /
+    独立体力条可以同时运行,各自只拦自己的重复实例。
+
+    返回值:True/句柄 = 可以继续;False = 已有实例在跑,应退出;
+    None = 拿不到互斥体(非 Windows 之类),不拦着。
+
+    最多等 3 秒:非管理员启动时会 ShellExecuteW 以管理员身份重启自己,
+    父子进程有极短的交接窗口,不能把这当成"已有一个实例"。
+    开发/测试要开多个实例时设环境变量 PHASMO_TIMER_ALLOW_MULTI=1。
+    """
+    if os.environ.get("PHASMO_TIMER_ALLOW_MULTI") == "1":
+        return None
+    try:
+        k32 = ctypes.windll.kernel32
+    except Exception:
+        return None
+    ERROR_ALREADY_EXISTS = 183
+    mutex = MODE_MUTEX[_app_mode()]
+    for _ in range(30):
+        try:
+            h = k32.CreateMutexW(None, False, mutex)
+            err = k32.GetLastError()
+        except Exception:
+            return None
+        if not h:
+            return None                      # 建不出来就别拦,宁可多开也别开不了
+        if err != ERROR_ALREADY_EXISTS:
+            return h                         # 持有句柄直到进程退出
+        try:
+            k32.CloseHandle(h)
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def _set_timer_precision(hi_res):
@@ -617,12 +869,123 @@ def match_hotkey(hotkeys, name, mods):
 
 
 # ----------------------------------------------------------------------
+# 体力模型(纯逻辑,不碰窗口 —— 和 phasmo-footstep-dsp/selftest_stamina.py 同一套)
+# ----------------------------------------------------------------------
+class StaminaModel(object):
+    """三态,照游戏代码里的优先级排:
+
+        力竭恢复  +0.6/秒,满 5 秒吸附到 3.0,这段时间按 Shift 也不跑
+        跑        -1.0/秒
+        其余      先空转 delay 秒(什么都不回),再 +1.0/秒
+
+    「停跑后先空转 2 秒」不是习惯问题,是代码里 [0x44] 那个计时器:
+    它在计时期间只减自己、不碰体力,归零后才走正常回复分支。
+    """
+
+    def __init__(self, cap=STAM_CAP, drain=STAM_DRAIN, regen=STAM_REGEN,
+                 delay=STAM_REGEN_DELAY, winded_time=STAM_WINDED_TIME):
+        self.cap = float(cap)
+        self.drain = float(drain)
+        self.regen = float(regen)
+        self.delay_max = float(delay)
+        self.winded_time = float(winded_time)
+        self.reset()
+
+    def reset(self):
+        self.stam = self.cap
+        self.winded = False
+        self.wind_t = 0.0
+        self.delay = self.delay_max     # 还要空转多久才开始回体力
+        self.was_sprint = False
+
+    @property
+    def winded_rate(self):
+        """力竭恢复每秒给多少 —— 保证 winded_time 秒后正好补满整格。"""
+        return self.cap / self.winded_time if self.winded_time > 0 else self.cap
+
+    def step(self, dt, move, sprint_held, crouch):
+        """推进 dt 秒,返回这一帧到底在不在跑(界面要拿它显示状态)。"""
+        if self.winded:
+            # [0x38] 分支优先于一切:这段只补体力,不接受冲刺
+            sprint = False
+            self.wind_t += dt
+            self.stam = min(self.cap, self.stam + self.winded_rate * dt)
+            if self.wind_t >= self.winded_time:
+                self.stam = self.cap        # 到点吸附到满,不留 2.999
+                self.winded = False
+                self.wind_t = 0.0
+                self.delay = self.delay_max
+        else:
+            sprint = bool(sprint_held) and bool(move) and not crouch and self.stam > 0.0
+            if sprint and not self.was_sprint:
+                self.delay = self.delay_max  # 起跑就重新武装那 2 秒
+            if sprint:
+                self.stam = max(0.0, self.stam - self.drain * dt)
+                if self.stam <= 0.0:
+                    self.stam = 0.0
+                    self.winded = True
+                    self.wind_t = 0.0
+            else:
+                if self.delay > 0.0:
+                    self.delay = max(0.0, self.delay - dt)
+                elif self.stam < self.cap:
+                    self.stam = min(self.cap, self.stam + self.regen * dt)
+
+        self.was_sprint = sprint
+        return sprint
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def _round_rect(cv, x0, y0, x1, y1, r, **kw):
+    """Tk Canvas 没有原生圆角矩形,这里用 smooth 多边形近似。
+
+    ⚠️ 半径会被夹到「宽/高的一半」以内,否则圆角会互相穿插、形状炸掉。
+    体力条的三段块和以后的胶囊条都走这个函数。
+    """
+    r = max(0.0, min(float(r), (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    pts = [
+        x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
+        x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+        x0, y1, x0, y1 - r, x0, y0 + r, x0, y0,
+    ]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+def _work_area():
+    """屏幕工作区(去掉任务栏),用来把体力条摆到左下角。
+
+    用 SPI_GETWORKAREA 而不是 winfo_screenheight:Tk 的坐标和这个 API 同在
+    系统的 DPI 虚拟化坐标系里,两者能直接混用;而且它排掉了任务栏 ——
+    否则 150% 缩放下体力条会被任务栏压掉一截。
+    """
+    r = _RECT()
+    try:
+        ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)
+    except Exception:
+        return 0, 0, 0, 0
+    if r.right - r.left <= 0 or r.bottom - r.top <= 0:
+        return 0, 0, 0, 0
+    return r.left, r.top, r.right, r.bottom
+
+
+# ----------------------------------------------------------------------
 # 主程序
 # ----------------------------------------------------------------------
 class SimpleGameTimer(object):
 
     def __init__(self):
-        # 配置住用户目录(与程序文件夹分离);旧版放在程序旁边的会被接过来一次
+        # 运行模式(2026-11-09 三套拆分):「_has_timer / _has_stamina」决定建哪些
+        # 窗口、托盘项、设置分区。整个进程只有一种模式,见模块顶上的 APP_MODE。
+        self.mode = _app_mode()
+        self._has_timer = self.mode in ("both", "timer")
+        self._has_stamina = self.mode in ("both", "stamina")
+
+        # 配置住用户目录(与程序文件夹分离);三套各有各的文件(timer.ini /
+        # stamina.ini / config.ini),互不干扰。旧版放在程序旁边的会被接过来一次
         cfg_path, self._config_migrated = _resolve_config_path()
         self.cfg = Config(cfg_path)
 
@@ -680,10 +1043,30 @@ class SimpleGameTimer(object):
         # ---- 计时参数(从配置读,热重载时刷新) ----
         self._load_timer_params()
         self.hotkeys = self._load_hotkeys()
+        self._load_stamina_keys()
+
+        # ---- 体力条状态 ----
+        self.stam_model = StaminaModel()
+        self._stam_win = None
+        self._stam_cv = None
+        self._stam_id = None          # 体力条自己的 after id(和 _tick_id 无关)
+        self._stam_t = time.perf_counter()
+        self._stam_prev_reset = False
+        self._stam_drag = None
+        # 按住的键名集合(大写)。修饰键也收进来 —— SHIFT 既是"跑"也可能被改绑。
+        self._down_keys = set()
 
         self._build_window()
+        if not self._has_timer:
+            # 体力条工具：计时器控件照建（很多共用方法要用到它们），但 root 一直
+            # 藏着不上屏 —— 必须在第一次 geometry 之前 withdraw，否则会闪一下。
+            self.root.withdraw()
         self._apply_style()
         self._relayout()          # 末尾会调 _apply_view_mode,主显示区在那里摆
+
+        if self._has_stamina:
+            self._build_stamina_window()
+            self._start_stamina()
 
         self._start_tray()
         # 快照建立时要刷托盘菜单(「恢复上次设置」从灰变亮),见 Config.save
@@ -717,6 +1100,24 @@ class SimpleGameTimer(object):
                 table[action] = (mods, base)
         return table
 
+    def _load_stamina_keys(self):
+        """[Stamina] 里的按住类按键 + 显隐开关。和 self.hotkeys 分开存。
+
+        spec_to_parts 直接复用:体力键也支持 CTRL+T 这种组合写法,
+        虽然游戏里用不上,但配置里能写就统一按同一套解析。
+        """
+        self.stam_keys = {}
+        # 写死的那几个(游戏键)先铺底,再从配置里补「归满」
+        for ckey, name in STAM_FIXED_KEYS.items():
+            mods, base = spec_to_parts(name)
+            if base:
+                self.stam_keys[ckey] = (mods, base)
+        for _action, ckey, _label in STAMINA_KEYS:
+            mods, base = spec_to_parts(self.cfg.get("Stamina", ckey))
+            if base:
+                self.stam_keys[ckey] = (mods, base)
+        self.stam_enabled = bool(self.cfg.get_int("Stamina", "enabled"))
+
     def _reload_from_disk(self):
         """外部改动了 config.ini —— 重新读取并应用到界面。"""
         was_editing = self.edit_mode
@@ -727,6 +1128,8 @@ class SimpleGameTimer(object):
         self.cfg.load()
         self._load_timer_params()
         self.hotkeys = self._load_hotkeys()
+        # 体力条的按键 / 显隐 / 位置也跟着配置走(手改 key_sprint 之类的立刻生效)
+        self._sync_stamina()
         # 改键窗口开着时,外部手改 config.ini 也要跟着刷键帽(窗口没开时是空操作)
         self._refresh_hotkey_list()
         self._apply_style()
@@ -768,7 +1171,7 @@ class SimpleGameTimer(object):
     # ==================================================================
     def _build_window(self):
         self.root = tk.Tk()
-        self.root.title(APP_TITLE)
+        self.root.title(_app_title())
         self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
 
@@ -942,6 +1345,8 @@ class SimpleGameTimer(object):
         self.edit_border.config(bg=self.bg_color,
                                 highlightbackground=COLOR_EDIT_BORDER)
         self.edit_hint.config(bg=self.bg_color, fg=COLOR_EDIT_BORDER)
+        # 透明度是全局的,体力条跟着一起变(它在 __init__ 里比主窗口晚建,已判空)
+        self._apply_stamina_style()
 
     def _main_color(self):
         # 三色:初始色(还没按过 F1)/ 启用态(虚化)/ 停用态
@@ -1019,6 +1424,13 @@ class SimpleGameTimer(object):
         # 它顺便会把那一行的青色高亮撤掉(超时是三个出口里最容易被漏掉的那个)
         if self._capturing and time.monotonic() > self._capture_deadline:
             self._cancel_capture()
+
+        # 体力条工具(2026-11-09 拆分):没有计时器可画 —— 配置文件热重载和
+        # 改键超时已经做完,直接每秒醒一次继续轮询就行。体力条自己有自己的
+        # _stam_tick(30Hz),不依赖这里。
+        if not self._has_timer:
+            self._tick_id = self.root.after(1000, self._tick)
+            return
 
         now = time.monotonic()
         delay = 1000  # 空闲时也每秒醒一次,顺便轮询配置文件
@@ -1137,6 +1549,356 @@ class SimpleGameTimer(object):
             self.time_label.place(x=20, y=20)
 
     # ==================================================================
+    # 体力条浮窗
+    # ==================================================================
+    def _build_stamina_window(self):
+        """独立浮窗 —— 不塞进主窗口。
+
+        主窗口是"内容多大就多大"的一小块,而且位置在用户拖哪儿是哪儿;
+        体力条要的是**固定贴在屏幕左下角**,两者的定位逻辑根本不一样,
+        塞在一起只会互相拖累(主窗口改字号时体力条跟着跳)。
+        """
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=COLOR_BG)
+        cv = tk.Canvas(win, width=STAM_W, height=STAM_H, bg=COLOR_BG,
+                       highlightthickness=0)
+        cv.pack()
+        # 2026-11-09(拆分三工具):体力条工具没有计时器主窗口可关,
+        # 重启脚本是按 PID 给顶层窗口发 WM_CLOSE 的 —— 不接这条,
+        # 体力条窗口被拆掉后进程会带着托盘图标变成孤儿。绑到 close_program
+        # 才能走到 _tray.stop() -> os._exit(0) 的干净退出路径。
+        win.protocol("WM_DELETE_WINDOW", self.close_program)
+        win.withdraw()
+        self._stam_win = win
+        self._stam_cv = cv
+        self._stam_move = self._stam_sprint = self._stam_crouch = False
+
+    # ---------------- 大小(百分比) ----------------
+    def _stam_scale(self):
+        try:
+            v = int(self.cfg.get_int("Stamina", "scale"))
+        except Exception:
+            v = 100
+        return max(STAM_SCALE_MIN, min(STAM_SCALE_MAX, v))
+
+    def _stam_width(self):
+        """长度百分比(只影响宽度)。缺键 / 坏值都按 100 兜底。"""
+        try:
+            v = int(self.cfg.get_int("Stamina", "width"))
+        except Exception:
+            v = 100
+        if v <= 0:                      # 键刚补进旧配置时可能是空/0
+            v = 100
+        return max(STAM_WIDTH_MIN, min(STAM_WIDTH_MAX, v))
+
+    def _stam_geom(self):
+        """(宽, 高, 缩放系数)。所有画图和摆位都从这里取,别再直接写 STAM_W。
+
+        宽 = STAM_W × scale × width,高只吃 scale —— 长度可以单独拉长/压短,
+        但条子粗细、字号仍由「大小」决定。
+        """
+        s = self._stam_scale() / 100.0
+        k = self._stam_width() / 100.0
+        return (max(120, int(round(STAM_W * s * k))),
+                max(40, int(round(STAM_H * s))), s)
+
+    def _set_stam_scale(self, v):
+        v = max(STAM_SCALE_MIN, min(STAM_SCALE_MAX, int(round(v))))
+        self.cfg.set("Stamina", "scale", v)
+        self.cfg.save()
+        self._apply_stam_scale()
+        self._refresh_tweak_values()
+
+    def _set_stam_width(self, v):
+        v = max(STAM_WIDTH_MIN, min(STAM_WIDTH_MAX, int(round(v))))
+        self.cfg.set("Stamina", "width", v)
+        self.cfg.save()
+        self._apply_stam_scale()
+        self._refresh_tweak_values()
+
+    def _apply_stam_scale(self):
+        """改完大小:画布尺寸、重画、重新摆位(自动贴边的要跟着变锚点)。"""
+        if not self._stam_win:
+            return
+        w, h, _ = self._stam_geom()
+        try:
+            if not self._stam_win.winfo_exists():
+                return
+            self._stam_cv.config(width=w, height=h)
+        except tk.TclError:
+            return
+        self._draw_stamina()
+        self._place_stamina_window()
+
+    def _stam_saved_pos(self):
+        """配置里存的位置;没存 / 存的已经不在屏幕上 → None(退回自动摆)。"""
+        sx = self.cfg.get("Stamina", "x")
+        sy = self.cfg.get("Stamina", "y")
+        if not sx or not sy:
+            return None
+        try:
+            x, y = int(float(sx)), int(float(sy))
+        except ValueError:
+            return None
+        w, h, _ = self._stam_geom()
+        left, top, right, bottom = _work_area()
+        if right - left > 0 and (x <= left - w or y <= top - h
+                                 or x >= right - 20 or y >= bottom - 20):
+            # 换过分辨率 / 拔过副屏:存下来的坐标已经点不到了,别让体力条消失
+            return None
+        return x, y
+
+    def _place_stamina_window(self):
+        if not self._stam_win:
+            return
+        w, h, _ = self._stam_geom()
+        pos = self._stam_saved_pos()
+        left, top, right, bottom = _work_area()
+        if pos is None:
+            if right - left > 0:
+                pos = (left + STAM_MARGIN, bottom - h - STAM_MARGIN)
+            else:
+                pos = (STAM_MARGIN,
+                       self.root.winfo_screenheight() - h - 60)
+        elif right - left > 0:
+            # 存过位置也要夹一下:放大之后右下可能顶出去,不能让条子露到屏幕外
+            pos = (max(left, min(pos[0], right - w)),
+                   max(top, min(pos[1], bottom - h)))
+        self._stam_win.geometry(_fmt_geometry(w, h, pos[0], pos[1]))
+
+    def _apply_stamina_style(self):
+        if not self._stam_win:
+            return
+        try:
+            self._stam_win.attributes(
+                "-alpha", max(0.1, min(1.0, self.cfg.get_float("Display", "opacity"))))
+            # 和主窗口同一套:平时的底色就是透明色(游戏点击穿透),
+            # 编辑模式换成不存在的颜色,整块变成实心可拖
+            self._stam_win.attributes(
+                "-transparentcolor",
+                TRANSPARENT_DISABLED if self.edit_mode else COLOR_BG)
+        except tk.TclError:
+            pass
+        # 底部那行字在编辑模式下要换成「拖动移动 · 滚轮缩放」,所以得重画
+        self._draw_stamina()
+
+    def _sync_stamina(self):
+        """按配置把体力条摆好 / 藏起来 / 开始或停止积分。所有入口都走这里。"""
+        self._load_stamina_keys()
+        if self._stam_win is None:
+            return
+        if not self.stam_enabled:
+            self._stop_stamina()
+            return
+        # 先按配置把尺寸/位置/画面整一遍,再套样式(样式里也会重画一次,
+        # 因为编辑模式的底部提示文字要跟着换)
+        self._apply_stam_scale()
+        self._apply_stamina_style()
+        self._stam_win.deiconify()
+        self._stam_win.attributes("-topmost", True)
+        if self._stam_id is None:
+            self._stam_t = time.perf_counter()
+            self._draw_stamina()
+            self._stam_id = self.root.after(STAM_TICK_MS, self._stam_tick)
+
+    def _start_stamina(self):
+        self._sync_stamina()
+
+    def _stop_stamina(self):
+        if self._stam_id:
+            try:
+                self.root.after_cancel(self._stam_id)
+            except Exception:
+                pass
+            self._stam_id = None
+        if self._stam_win:
+            self._stam_win.withdraw()
+
+    def _toggle_stamina(self):
+        on = not bool(self.cfg.get_int("Stamina", "enabled"))
+        self.cfg.set("Stamina", "enabled", 1 if on else 0)
+        self.cfg.save()
+        self._sync_stamina()
+        self._refresh_tray()
+
+    # ---------------- 按键状态 ----------------
+    def _key_down(self, ckey):
+        """[Stamina] 里某个角色键现在是不是按住的(组合键要求修饰键也都在)。"""
+        parts = self.stam_keys.get(ckey)
+        if not parts:
+            return False
+        mods, base = parts
+        for m in mods:
+            if not _spec_down(m, self._pressed_mods):
+                return False
+        return _spec_down(base, self._down_keys)
+
+    # ---------------- 积分 ----------------
+    def _stam_tick(self):
+        self._stam_id = None
+        now = time.perf_counter()
+        dt = now - self._stam_t
+        self._stam_t = now
+        if dt < 0.0:
+            dt = 0.0
+        # 卡顿 / 切出去一会儿再回来:按 0.1 秒算,别让体力条一口气跳一大截
+        if dt > 0.10:
+            dt = 0.10
+        self._stam_step(dt)
+        self._draw_stamina()
+        self._stam_id = self.root.after(STAM_TICK_MS, self._stam_tick)
+
+    def _stam_step(self, dt):
+        reset_down = self._key_down("key_reset")
+        if reset_down and not self._stam_prev_reset:
+            # 和浮窗版同一个语义:归满,并从这一刻重新算
+            self.stam_model.reset()
+        self._stam_prev_reset = reset_down
+
+        move = any(self._key_down(k) for k in
+                   ("key_forward", "key_back", "key_left", "key_right"))
+        sprint_held = self._key_down("key_sprint")
+        crouch = self._key_down("key_crouch")
+        self._stam_move = move
+        self._stam_crouch = crouch
+        self._stam_sprint = self.stam_model.step(dt, move, sprint_held, crouch)
+
+    # ---------------- 画面 ----------------
+    def _stam_state_text(self):
+        # 2026-11-09 v2.6 用户点名「体力条只留体力条相关的提示」= 去掉「蹲下」:
+        # 蹲不蹲是移动状态,不是体力状态;蹲着时就照常显示满格 / 回复中 / 回复延迟。
+        # ⚠️ 别再把这行加回来(蹲下仍会传给体力模型,只是不再占用状态文字)。
+        m = self.stam_model
+        if m.winded:
+            return "力竭恢复 {:.1f}s".format(
+                max(0.0, m.winded_time - m.wind_t)), HK_CLOSE_HOVER
+        if self._stam_sprint:
+            return "跑步中", HK_WARN
+        if m.stam >= m.cap - 1e-6:
+            return "满格", HK_ACCENT
+        if m.delay > 0.0:
+            return "回复延迟 {:.1f}s".format(m.delay), HK_WARN
+        return "回复中", HK_ACCENT
+
+    def _draw_stamina(self):
+        cv = self._stam_cv
+        if cv is None:
+            return
+        try:
+            if not cv.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        m = self.stam_model
+        w, h, s = self._stam_geom()
+        cv.delete("all")
+        frac = (m.stam / m.cap) if m.cap > 0 else 0.0
+        if m.winded:
+            col = HK_WARN
+        elif frac > 0.5:
+            col = HK_ACCENT
+        elif frac > 0.2:
+            col = HK_WARN
+        else:
+            col = HK_CLOSE_HOVER
+
+        # 所有坐标都按 s 等比缩;字号的底线是 7 号,再小就认不出了
+        pad = max(6, int(round(12 * s)))
+        top = max(2, int(round(7 * s)))
+        f_small = max(7, int(round(9 * s)))
+
+        # 2026-11-09 v2.4 版面重排(用户点名「体力条看起来不太好看」):
+        # 状态文字从底部挪到右上,和左边「体力」同一行;下面只留三段条子。
+        # 状态加粗 —— 同样字号下细体在 150% 缩放下发虚,加粗后边缘干净很多。
+        # ⚠️ 字体族没换(用户说「字体先不改」),仍是 FONT_FAMILY_STATUS。
+        if self.edit_mode:
+            text, tcol = "编辑中", HK_ACCENT
+        else:
+            text, tcol = self._stam_state_text()
+        cv.create_text(pad, top, anchor="nw", text="体力", fill=HK_DIM,
+                       font=(FONT_FAMILY_STATUS, f_small))
+        cv.create_text(w - pad, top, anchor="ne", text=text, fill=tcol,
+                       font=(FONT_FAMILY_STATUS, f_small, "bold"))
+
+        # 三段独立圆角块(用户选的 B 方案)。段与段之间留 gap,
+        # 每段自己按体力比例填充;剩余不到半段时圆角自动收小,不会变成怪形。
+        x0, x1 = pad, w - pad
+        y0, y1 = int(round(26 * s)), int(round(44 * s))
+        if y1 - y0 < 4:                 # 缩到 60% 以下时别让条子细得看不见
+            y1 = y0 + 4
+        gap = max(3, int(round(5 * s)))
+        sw = (x1 - x0 - gap * 2) / 3.0
+        r = (y1 - y0) / 2.0
+        for k in range(3):
+            sx0 = x0 + k * (sw + gap)
+            sx1 = sx0 + sw
+            _round_rect(cv, sx0, y0, sx1, y1, r, fill="#2C2C2C", outline="")
+            seg = max(0.0, min(1.0, frac * 3.0 - k))
+            if seg > 0.02:
+                fw = max(3.0, sw * seg)
+                _round_rect(cv, sx0, y0, sx0 + fw, y1,
+                            min(r, fw / 2.0), fill=col, outline="")
+
+        if self.edit_mode:
+            # 编辑模式:描一圈青色边框(和主窗口 edit_border 同一个青),
+            # 底部那行直接写明「这是体力条」。
+            # ⚠️ 2026-11-08 用户反馈:原来只有一行 HK_DIM 灰字,玩家根本看不出
+            # 体力条进了编辑态,也分不清在编辑的是计时器还是体力条 ——
+            # 灰字必须换成青色加粗 + 边框,别再退回去。
+            cv.create_rectangle(1, 1, w - 1, h - 1, outline=HK_ACCENT, width=2)
+            cv.create_text(pad, int(round(47 * s)), anchor="nw",
+                           text="体力条 · 拖动 / 滚轮缩放",
+                           fill=HK_ACCENT,
+                           font=(FONT_FAMILY_STATUS, f_small, "bold"))
+
+    # ---------------- 编辑模式里的拖动 ----------------
+    def _bind_stam_drag(self, on):
+        cv = self._stam_cv
+        if cv is None:
+            return
+        try:
+            if not cv.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        pairs = (
+            ("<ButtonPress-1>", self._on_stam_drag_start),
+            ("<B1-Motion>", self._on_stam_drag_move),
+            ("<ButtonRelease-1>", self._on_stam_drag_end),
+            ("<MouseWheel>", self._on_stam_wheel),
+            ("<Button-3>", lambda e: self._exit_edit_mode()),
+        )
+        for seq, fn in pairs:
+            if on:
+                cv.bind(seq, fn, add="+")
+            else:
+                cv.unbind(seq)
+
+    def _on_stam_drag_start(self, event):
+        self._stam_drag = (event.x_root - self._stam_win.winfo_x(),
+                           event.y_root - self._stam_win.winfo_y())
+
+    def _on_stam_drag_move(self, event):
+        if not self._stam_drag:
+            return
+        self._stam_win.geometry("+{}+{}".format(
+            event.x_root - self._stam_drag[0], event.y_root - self._stam_drag[1]))
+
+    def _on_stam_drag_end(self, event):
+        self._stam_drag = None
+        # 拖过就写死坐标 —— 以后不再自动贴左下角(想回到自动:把 x / y 清空)
+        self.cfg.set("Stamina", "x", self._stam_win.winfo_x())
+        self.cfg.set("Stamina", "y", self._stam_win.winfo_y())
+        self.cfg.save()
+
+    def _on_stam_wheel(self, event):
+        """编辑模式里在体力条上滚轮 = 改大小(和主窗口滚轮改字号一个手感)。"""
+        step = STAM_SCALE_STEP if event.delta > 0 else -STAM_SCALE_STEP
+        self._set_stam_scale(self._stam_scale() + step)
+
+    # ==================================================================
     # 热键与鼠标
     # ==================================================================
     def _start_listeners(self):
@@ -1154,10 +1916,14 @@ class SimpleGameTimer(object):
             mod = MODIFIER_KEYS.get(key)
             if mod:
                 self._pressed_mods.add(mod)
+                # 体力条要知道"Shift 现在按着没有" —— 它既是修饰键也是「跑」。
+                # 用同一个名字存,配置里写 SHIFT 就查得到。
+                self._down_keys.add(mod)
                 return
 
             if name is None:
                 return
+            self._down_keys.add(name)
 
             # ---- 捕获新按键 ----
             if self._capturing:
@@ -1177,6 +1943,12 @@ class SimpleGameTimer(object):
             # 连发 —— 这是原版行为(原版只有 R 键有 _r_lock,其它键按住连发)。
             # 只有「切换主显示 / 秒表」保留锁,按住只切一次,免得画面疯狂闪烁。
             action = match_hotkey(self.hotkeys, name, frozenset(self._pressed_mods))
+            # 体力条工具没有计时器热键(2026-11-09 拆分):捕获/改键照常,只是
+            # 不再把按键派发给计时器动作。WASD/Shift/C/F7 走轮询,不靠这里。
+            # 唯一例外是「关闭程序」—— 纯体力条工具也要能一键退出(2026-11-09
+            # 用户点名,默认 F6,与计时器一致),其余计时器动作一律不认。
+            if not self._has_timer and action != "close":
+                return
             if action is None:
                 return
             if action == "toggle_stopwatch_view":
@@ -1192,10 +1964,12 @@ class SimpleGameTimer(object):
             mod = MODIFIER_KEYS.get(key)
             if mod:
                 self._pressed_mods.discard(mod)
+                self._down_keys.discard(mod)
                 return
             name = base_key_name(key)
             if name:
                 self._held_keys.discard(name)
+                self._down_keys.discard(name)
         except Exception:
             pass
 
@@ -1216,6 +1990,9 @@ class SimpleGameTimer(object):
             return
 
         # ---- 正常派发 ----
+        # 体力条工具没有计时器热键(鼠标键也属于计时器动作),捕获照常、派发跳过。
+        if not self._has_timer:
+            return
         # ⚠️ 这里**不能**再写 `and not self.active` / `and self.timer2_waiting` 这类
         # 状态条件 —— 条件已经挪进各自的 handler 里了(handle_right_click 开头就有
         # `if self.active: return`)。留在这儿的话,鼠标键一旦被改绑到别的动作,
@@ -1438,8 +2215,18 @@ class SimpleGameTimer(object):
         self._update_status_label()
 
     def close_program(self):
+        # ⚠️ 2026-11-09 修幽灵托盘图标:用户「每次打开托盘都发现多个计时器图标」。
+        # 根因:pystray 的 stop() **只是 PostMessage(WM_STOP)**,真正的
+        # Shell_NotifyIcon(NIM_DELETE) 在托盘消息循环线程的 finally 里跑
+        # (_mainloop -> _hide)。原来 stop() 后面紧跟 os._exit(0),线程还没来得及
+        # 处理那条消息进程就没了 —— Explorer 那边就留一个没有进程的图标壳,
+        # **每次退出都留一个**,攒着就是"托盘里一堆计时器"。
+        # 修法:停之前先拿到托盘线程,退出前 join 一下,等 NIM_DELETE 走完。
+        tray_thread = None
         try:
             if self._tray:
+                # pystray 内部字段,拿不到就当没有(_run 里才赋值,启动早期可能是 None)
+                tray_thread = getattr(self._tray, "_thread", None)
                 self._tray.stop()
         except Exception:
             pass
@@ -1453,7 +2240,15 @@ class SimpleGameTimer(object):
             self.root.destroy()
         except Exception:
             pass
-        # 托盘线程不一定能干净退出,直接结束进程保证不留后台
+        # 等托盘线程收尾(注销图标 + DestroyWindow + 注销窗口类)。
+        # 1 秒够用;_hide() 是同步的,正常几十毫秒就回来。超时也照退,
+        # 顶多留一个图标,不能让程序卡着不退。
+        try:
+            if tray_thread is not None and tray_thread.is_alive():
+                tray_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        # 托盘线程收尾完之后再硬退,保证不留后台线程
         os._exit(0)
 
     # ==================================================================
@@ -1464,27 +2259,35 @@ class SimpleGameTimer(object):
             return
         self.edit_mode = True
 
-        # 关掉透明色,让整个窗口变成实心可点区域
-        self.root.attributes("-transparentcolor", TRANSPARENT_DISABLED)
-        self.edit_border.place(x=0, y=0,
-                               width=self.root.winfo_width(),
-                               height=self.root.winfo_height())
-        self.edit_border.lower()
-        self.edit_hint.config(text="拖动移动 · 滚轮调字号 · 右键退出")
-        self.edit_hint.place(relx=0.5, y=self.root.winfo_height() - 26, anchor="n")
-        self._bind_drag(True)
+        if self._has_timer:
+            # 关掉透明色,让整个窗口变成实心可点区域
+            self.root.attributes("-transparentcolor", TRANSPARENT_DISABLED)
+            self.edit_border.place(x=0, y=0,
+                                   width=self.root.winfo_width(),
+                                   height=self.root.winfo_height())
+            self.edit_border.lower()
+            self.edit_hint.config(text="拖动移动 · 滚轮调字号 · 右键退出")
+            self.edit_hint.place(relx=0.5, y=self.root.winfo_height() - 26, anchor="n")
+            self._bind_drag(True)
+        # 体力条是独立浮窗,得单独解除透明 + 单独绑拖动(同一个编辑模式管两个窗口)。
+        # 体力条工具里只有这一段 —— 计时器窗口根本没上屏(见 __init__)。
+        self._apply_stamina_style()
+        self._bind_stam_drag(True)
         self._refresh_tray()
 
     def _exit_edit_mode(self, save=True):
         if not self.edit_mode:
             return
         self.edit_mode = False
-        self._bind_drag(False)
-        self.edit_border.place_forget()
-        self.edit_hint.place_forget()
-        self.root.attributes("-transparentcolor", self.bg_color)
+        if self._has_timer:
+            self._bind_drag(False)
+            self.edit_border.place_forget()
+            self.edit_hint.place_forget()
+            self.root.attributes("-transparentcolor", self.bg_color)
+        self._bind_stam_drag(False)
+        self._apply_stamina_style()
 
-        if save:
+        if save and self._has_timer:
             self.cfg.set("Display", "window_x", self._pos[0])
             self.cfg.set("Display", "window_y", self._pos[1])
             self.cfg.save()
@@ -1573,14 +2376,25 @@ class SimpleGameTimer(object):
         except Exception:
             image = Image.new("RGBA", (64, 64), (26, 26, 26, 255))
 
-        menu = pystray.Menu(
+        # 2026-11-09 三套拆分:菜单按模式裁 —— 计时器工具没有「显示体力条」,
+        # 体力条工具没有计时器相关项(它也从不隐藏自己,那条勾没意义)。
+        items = [
             pystray.MenuItem("编辑模式", lambda: self._tray_call(self._toggle_edit_mode),
                              checked=lambda item: self.edit_mode),
-            pystray.Menu.SEPARATOR,
-            # 2026-10-14 起「透明度…」和「修改热键…」合并成一个窗口 ——
-            # 里面分区:外观(透明度/字号)、计时(上限)、热键。
-            pystray.MenuItem("设置…", lambda: self._tray_call(self._open_hotkey_window)),
-            pystray.Menu.SEPARATOR,
+        ]
+        if self._has_timer and self._has_stamina:
+            # 二合一的体力条浮窗开关。checked 和 enabled 一样,是**重建菜单时**
+            # 求值,所以 _toggle_stamina 最后要调 _refresh_tray,否则勾不会变。
+            items.append(
+                pystray.MenuItem("显示体力条", lambda: self._tray_call(self._toggle_stamina),
+                                 checked=lambda item: bool(self.cfg.get_int("Stamina", "enabled"))))
+        items.append(pystray.Menu.SEPARATOR)
+        # 2026-10-14 起「透明度…」和「修改热键…」合并成一个窗口 ——
+        # 里面分区:外观(透明度/字号)、计时(上限)、体力条、热键。没建的东西不显示。
+        items.append(
+            pystray.MenuItem("设置…", lambda: self._tray_call(self._open_hotkey_window)))
+        items.append(pystray.Menu.SEPARATOR)
+        items += [
             # 2026-10-14 晚用户点名:重新载入配置要挪到打开配置文件**正下面**
             # (原来在"使用说明"后面)—— 两个都是"跟配置文件打交道"的,挨着好找。
             pystray.MenuItem("打开配置文件", lambda: self._tray_call(self._open_config)),
@@ -1590,8 +2404,8 @@ class SimpleGameTimer(object):
             # save(force_snapshot=True),快照必定是"点重置前一瞬间") ——
             # 2026-10-14 晚用户点名:"包含的话就把恢复上次位置删了",已删。
             pystray.MenuItem("重置窗口位置", lambda: self._tray_call(self._reset_position)),
-            # 整份设置的还原点 = config.ini 旁边的自动快照(五槽轮转:config.prev.ini
-            # ~ config.prev5.ini,见 Config.save);点一次往回退一层,再点继续退。
+            # 整份设置的还原点 = 配置文件旁边的自动快照(五槽轮转:*.prev.ini
+            # ~ *.prev5.ini,见 Config.save);点一次往回退一层,再点继续退。
             # 快照由"保存"创建,而菜单重建才刷新置灰:enabled 和上面的 checked 一样,
             # 是**重建菜单时**求值,win32 菜单建一次就复用、不会自己刷 —— Config.save
             # 建快照时会通过 snapshot_hook 调一次 _refresh_tray,别把那根线剪了。
@@ -1599,9 +2413,10 @@ class SimpleGameTimer(object):
                              enabled=lambda item: os.path.exists(self._prev_settings_path())),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", lambda: self._tray_call(self.close_program)),
-        )
+        ]
+        menu = pystray.Menu(*items)
 
-        self._tray = pystray.Icon("PhasmoTimer", image, APP_TITLE, menu)
+        self._tray = pystray.Icon("PhasmoTools", image, _app_title(), menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
     def _toggle_edit_mode(self):
@@ -1700,65 +2515,107 @@ class SimpleGameTimer(object):
             tk.Label(body, text=txt, bg=HK_BG, fg=HK_DIM,
                      font=(FONT_FAMILY_STATUS, 9)).pack(anchor="w", padx=15, pady=(12, 3))
 
-        sec_header("外观")
-        self._build_tweak_row(body, {
-            # 2026-10-15 用户点名:四行参数统一改成**可输入** —— 输入时只打数字,
-            # 提交后程序自动补单位(「200」→「200秒」),数字和单位是同一段文本、
-            # 同一个颜色;用户自己打的单位会被剥掉、强制换成程序单位
-            # (机制见 _build_tweak_row 的 commit)。
-            # ⚠️ 「点值恢复默认」由此**整体退休**(点击 = 落光标编辑,冲突);
-            # 要回默认值直接在框里输,大回退还留着「恢复上次设置」兜底。
-            "key": "opacity", "field": "窗口透明度", "unit": "%",
-"lo": 10, "hi": 100,
-            "val": lambda: int(round(self.cfg.get_float("Display", "opacity") * 100)),
-            "step": lambda d: self._bump_opacity(0.05 * d),
-            "set": lambda v: self._set_opacity(v / 100.0),
-        })
-        self._build_tweak_row(body, {
-            # ⚠️ config 里仍是三个字号键(font_size / timer2_font_size /
-            # status_font_size),比例锁死、永远一起动(见 _bump_font);
-            # 界面上**合成一行**就够了 —— 2026-10-14 用户点名:三个字号其实
-            # 是一个东西,就放一个「计时器字号」,不用多放。别再拆回三行。
-            # 输入框里键入的是**主字号**,差值应用到三个键(见 _set_font)。
-            "key": "font_size", "field": "计时器字号", "unit": "",
-"lo": 8, "hi": 200,
-            "val": lambda: self.cfg.get_int("Display", "font_size"),
-            "step": lambda d: self._bump_font(d),
-            "set": lambda v: self._set_font(v),
-        })
+        # 2026-11-09 三套拆分:设置窗口按模式裁分区 —— 计时器工具没有「体力条」,
+        # 体力条工具只留「体力条」三行(归满键 / 大小 / 长度,用户定),没有外观、
+        # 计时、热键。_tw / _hotkey_rows 只在建行时用到,没建的行刷新时自然跳过。
+        if self._has_timer:
+            sec_header("外观")
+            self._build_tweak_row(body, {
+                # 2026-10-15 用户点名:四行参数统一改成**可输入** —— 输入时只打数字,
+                # 提交后程序自动补单位(「200」→「200秒」),数字和单位是同一段文本、
+                # 同一个颜色;用户自己打的单位会被剥掉、强制换成程序单位
+                # (机制见 _build_tweak_row 的 commit)。
+                # ⚠️ 「点值恢复默认」由此**整体退休**(点击 = 落光标编辑,冲突);
+                # 要回默认值直接在框里输,大回退还留着「恢复上次设置」兜底。
+                "key": "opacity", "field": "窗口透明度", "unit": "%",
+    "lo": 10, "hi": 100,
+                "val": lambda: int(round(self.cfg.get_float("Display", "opacity") * 100)),
+                "step": lambda d: self._bump_opacity(0.05 * d),
+                "set": lambda v: self._set_opacity(v / 100.0),
+            })
+            self._build_tweak_row(body, {
+                # ⚠️ config 里仍是三个字号键(font_size / timer2_font_size /
+                # status_font_size),比例锁死、永远一起动(见 _bump_font);
+                # 界面上**合成一行**就够了 —— 2026-10-14 用户点名:三个字号其实
+                # 是一个东西,就放一个「计时器字号」,不用多放。别再拆回三行。
+                # 输入框里键入的是**主字号**,差值应用到三个键(见 _set_font)。
+                "key": "font_size", "field": "计时器字号", "unit": "",
+    "lo": 8, "hi": 200,
+                "val": lambda: self.cfg.get_int("Display", "font_size"),
+                "step": lambda d: self._bump_font(d),
+                "set": lambda v: self._set_font(v),
+            })
 
-        sec_header("计时")
-        self._build_tweak_row(body, {
-            # 上/下限:1~9 分钟。主计时器归零会自动重开(见 _tick),
-            # 调这个就是调滚屏归零的周期。输入框里键入的数字按**分钟**算
-            # (行上写的什么单位,输进去的就是什么单位)。
-            "key": "main_max", "field": "主计时器上限", "unit": "分钟",
-"lo": 1, "hi": 9,
-            "val": lambda: self.cfg.get_int("Timer", "main_max") // 60,
-            "step": lambda d: self._tweak_set("Timer", "main_max",
-                                              max(60, min(540, self.cfg.get_int("Timer", "main_max") + d * 60))),
-            "set": lambda v: self._tweak_set("Timer", "main_max", v * 60),
-        })
-        self._build_tweak_row(body, {
-            # 2026-10-15 用户点名:①单位用**秒**(旧:分钟);②可输入。
-            # 范围 10 秒~1 小时,输入超范围自动卡到边界;−/+ 步长 ±30 秒。
-            "key": "stopwatch_max", "field": "秒表上限", "unit": "秒",
-"lo": 10, "hi": 3600,
-            "val": lambda: self.cfg.get_int("Timer", "stopwatch_max"),
-            "step": lambda d: self._tweak_set("Timer", "stopwatch_max",
-                                              max(10, min(3600, self.cfg.get_int("Timer", "stopwatch_max") + d * 30))),
-            "set": lambda v: self._tweak_set("Timer", "stopwatch_max", v),
-        })
+            sec_header("计时")
+            self._build_tweak_row(body, {
+                # 上/下限:1~9 分钟。主计时器归零会自动重开(见 _tick),
+                # 调这个就是调滚屏归零的周期。输入框里键入的数字按**分钟**算
+                # (行上写的什么单位,输进去的就是什么单位)。
+                "key": "main_max", "field": "主计时器上限", "unit": "分钟",
+    "lo": 1, "hi": 9,
+                "val": lambda: self.cfg.get_int("Timer", "main_max") // 60,
+                "step": lambda d: self._tweak_set("Timer", "main_max",
+                                                  max(60, min(540, self.cfg.get_int("Timer", "main_max") + d * 60))),
+                "set": lambda v: self._tweak_set("Timer", "main_max", v * 60),
+            })
+            self._build_tweak_row(body, {
+                # 2026-10-15 用户点名:①单位用**秒**(旧:分钟);②可输入。
+                # 范围 10 秒~1 小时,输入超范围自动卡到边界;−/+ 步长 ±30 秒。
+                "key": "stopwatch_max", "field": "秒表上限", "unit": "秒",
+    "lo": 10, "hi": 3600,
+                "val": lambda: self.cfg.get_int("Timer", "stopwatch_max"),
+                "step": lambda d: self._tweak_set("Timer", "stopwatch_max",
+                                                  max(10, min(3600, self.cfg.get_int("Timer", "stopwatch_max") + d * 30))),
+                "set": lambda v: self._tweak_set("Timer", "stopwatch_max", v),
+            })
 
-        sec_header("热键")
         self._hotkey_rows = {}
-        rows = tk.Frame(body, bg=HK_BG)
-        rows.pack(fill="both", expand=True)
-        for caption, actions in groups:
-            tk.Label(rows, text=caption, bg=HK_BG, fg=HK_DIM,
-                     font=(FONT_FAMILY_STATUS, 9)).pack(anchor="w", padx=15, pady=(9, 3))
-            for action in actions:
-                self._build_hotkey_row(rows, action)
+        if self._has_stamina:
+            # 体力条那一栏:和热键**同一个交互**(点一行、按新键),但存 [Stamina] 节。
+            # 放在热键上面 —— 它关联的是游戏里的按键,和下面那些"按一下触发一次"的
+            # 热键不是一类东西,分开摆在视觉上更清楚。
+            sec_header("体力条")
+            # 只剩「归满」能改(WASD / Shift / C 是游戏写死的,见 STAM_FIXED_KEYS),
+            # 所以不用再排两列,顺排一行就行。
+            for action, ckey, label in STAMINA_KEYS:
+                self._build_hotkey_row(body, action, section="Stamina",
+                                       config_key=ckey, label=label, compact=True)
+            # 大小:和上面「外观 / 计时」那几行同一套交互(−/+ 或直接输入百分比)。
+            # 编辑模式里在体力条上滚轮也能调,两边改的是同一个 [Stamina] scale。
+            self._build_tweak_row(body, {
+                "key": "stam_scale", "field": "体力条大小", "unit": "%",
+                "lo": STAM_SCALE_MIN, "hi": STAM_SCALE_MAX,
+                "val": lambda: self._stam_scale(),
+                "step": lambda d: self._set_stam_scale(
+                    self._stam_scale() + d * STAM_SCALE_STEP),
+                "set": lambda v: self._set_stam_scale(v),
+            })
+            # 长度(2026-11-09 v2.5 用户点名「增加一个设置可以调体力条的长度」):
+            # 只拉长/压短,条子粗细和字号仍归上面那行「大小」管。
+            self._build_tweak_row(body, {
+                "key": "stam_width", "field": "体力条长度", "unit": "%",
+                "lo": STAM_WIDTH_MIN, "hi": STAM_WIDTH_MAX,
+                "val": lambda: self._stam_width(),
+                "step": lambda d: self._set_stam_width(
+                    self._stam_width() + d * STAM_WIDTH_STEP),
+                "set": lambda v: self._set_stam_width(v),
+            })
+
+        if self._has_timer:
+            sec_header("热键")
+            rows = tk.Frame(body, bg=HK_BG)
+            rows.pack(fill="both", expand=True)
+            for caption, actions in groups:
+                tk.Label(rows, text=caption, bg=HK_BG, fg=HK_DIM,
+                         font=(FONT_FAMILY_STATUS, 9)).pack(anchor="w", padx=15, pady=(9, 3))
+                for action in actions:
+                    self._build_hotkey_row(rows, action)
+        else:
+            # 纯体力条工具(2026-11-09 拆分,用户点名「体力条也要一个快速关闭的
+            # 键,先跟计时器一样 F6」):没有计时器热键,只留「关闭程序」这一行。
+            # 键名和计时器共用 [Hotkeys] close,只是写在 stamina.ini 里,两边独立。
+            sec_header("热键")
+            self._build_hotkey_row(body, "close")
 
         tk.Frame(body, bg=HK_BORDER, height=1).pack(fill="x", pady=(9, 0))
         self._hotkey_hint = tk.StringVar(value="")
@@ -1772,8 +2629,13 @@ class SimpleGameTimer(object):
         # (比正中好看,也不会挡住任务栏)
         win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        # 夹一下:内容变多之后 reqheight 可能超过屏幕高,(sh-h)//3 会算出**负数**,
+        # 窗口直接顶到屏幕上面去,标题栏都拖不到。至少留 8px。
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry("{}x{}+{}+{}".format(
-            w, h, (win.winfo_screenwidth() - w) // 2, (win.winfo_screenheight() - h) // 3))
+            min(w, sw - 16), min(h, sh - 16),
+            max(8, (sw - min(w, sw - 16)) // 2),
+            max(8, min((sh - h) // 3, sh - h - 16))))
         win.lift()
         win.focus_force()
         # 无边框也拦一下 Alt+F4:不拦的话窗口被系统直接销毁,self._capturing
@@ -1943,10 +2805,21 @@ class SimpleGameTimer(object):
                                  "minus": minus, "plus": plus,
                                  "commit": commit_entry}
 
-    def _build_hotkey_row(self, parent, action):
-        """一行 = 左侧竖条 + 功能名 + 右侧键帽。整行一个 Frame,悬停高亮整块。"""
+    def _build_hotkey_row(self, parent, action, section="Hotkeys",
+                          config_key=None, label=None,
+                          pack=True, compact=False):
+        """一行 = 左侧竖条 + 功能名 + 右侧键帽。整行一个 Frame,悬停高亮整块。
+
+        section / config_key 是给体力条那几行用的:它们存在 [Stamina] 节、
+        键名也不是 action 本身(key_forward 等)。热键行照旧走默认值。
+
+        pack=False 时由调用方自己 grid(体力条那栏排成两列,省一半高度)。
+        compact=True 把上下留白压掉,同样是省高度用的。
+        """
+        config_key = config_key or action
         row = tk.Frame(parent, bg=HK_BG, cursor="hand2")
-        row.pack(fill="x")
+        if pack:
+            row.pack(fill="x")
 
         # 3px 竖条:平常和底色同色(等于隐形),捕获时亮成青色。
         # **一直占位**是故意的 —— 否则捕获时整行会往右挪 3px 抖一下。
@@ -1958,9 +2831,12 @@ class SimpleGameTimer(object):
         # 原因:键帽内容有两种字体(ASCII 用 Consolas、鼠标键用雅黑),两种字体的
         # 行高不一样,一旦让键帽参与撑高,「鼠标」那两行会比别的行矮一截。
         # 让雅黑 10 的功能名撑高,键帽(高度更小)由 pack 自动垂直居中。
-        name = tk.Label(row, text=HOTKEY_LABELS.get(action, action), bg=HK_BG,
-                        fg=HK_TEXT, font=(FONT_FAMILY_STATUS, 10), anchor="w")
-        name.pack(side="left", padx=(12, 8), pady=6)
+        name = tk.Label(row,
+                        text=label if label is not None
+                        else HOTKEY_LABELS.get(action, action),
+                        bg=HK_BG, fg=HK_TEXT,
+                        font=(FONT_FAMILY_STATUS, 10), anchor="w")
+        name.pack(side="left", padx=(12, 8), pady=3 if compact else 6)
 
         # 键帽:外面一个 1px 描边 Frame,里面才是文字(缩进 1px 就是描边)
         chip = tk.Frame(row, bg=HK_BORDER)
@@ -1970,12 +2846,15 @@ class SimpleGameTimer(object):
         chip_text.pack(padx=1, pady=1)
 
         self._hotkey_rows[action] = {"row": row, "marker": marker, "name": name,
-                                     "chip": chip, "chip_text": chip_text}
+                                     "chip": chip, "chip_text": chip_text,
+                                     "section": section,
+                                     "config_key": config_key}
 
         for w in (row, marker, name, chip, chip_text):
             w.bind("<Enter>", lambda e, a=action: self._hover_row(a, True))
             w.bind("<Leave>", lambda e, a=action: self._row_leave(a))
             w.bind("<Button-1>", lambda e, a=action: self._pick_row(a))
+        return row
 
     def _hover_row(self, action, on):
         r = self._hotkey_rows.get(action)
@@ -2030,7 +2909,7 @@ class SimpleGameTimer(object):
         for action, r in self._hotkey_rows.items():
             if not r["chip_text"].winfo_exists():
                 continue
-            key = self.cfg.get("Hotkeys", action) or ""
+            key = self.cfg.get(r["section"], r["config_key"]) or ""
             # MOUSE_LEFT -> 鼠标左键。只是显示,配置里存的还是规范写法。
             text = SPEC_DISPLAY.get(key, key) if key else "(未绑定)"
             r["chip_text"].config(text=text, font=_chip_font(text))
@@ -2047,7 +2926,7 @@ class SimpleGameTimer(object):
             if not r["row"].winfo_exists():
                 continue
             cap = (self._capturing == action)
-            bound = bool(self.cfg.get("Hotkeys", action))
+            bound = bool(self.cfg.get(r["section"], r["config_key"]))
             r["row"].config(bg=HK_CAP_BG if cap else HK_BG)
             # 竖条颜色跟着行底色走(而不是写死 HK_BG):这一行可能正被鼠标悬停着,
             # 写死会在悬停的行上留一条 3px 的深色缝
@@ -2074,11 +2953,24 @@ class SimpleGameTimer(object):
                self.cfg.get_int("Display", "window_y"))
         default_pos = (int(DEFAULTS["Display"]["window_x"]),
                        int(DEFAULTS["Display"]["window_y"]))
-        self._pos = default_pos
-        self.cfg.set("Display", "window_x", self._pos[0])
-        self.cfg.set("Display", "window_y", self._pos[1])
-        self.cfg.save(force_snapshot=(cur != default_pos))
-        self._relayout()
+        # 体力条也算「窗口位置」的一部分(2026-11-08 用户要求:和计时器一样,
+        # 重置位置要一起管)。清空 x / y = 回到自动贴左下角。
+        # 2026-11-09 拆分:体力条工具只有体力条,别去动 Display 的位置键。
+        stam_moved = bool(self.cfg.get("Stamina", "x") or self.cfg.get("Stamina", "y"))
+        cur_moved = self._has_timer and cur != default_pos
+        moved = cur_moved or (self._has_stamina and stam_moved)
+        if self._has_timer:
+            self._pos = default_pos
+            self.cfg.set("Display", "window_x", self._pos[0])
+            self.cfg.set("Display", "window_y", self._pos[1])
+        if self._has_stamina:
+            self.cfg.set("Stamina", "x", "")
+            self.cfg.set("Stamina", "y", "")
+        self.cfg.save(force_snapshot=moved)
+        if self._has_timer:
+            self._relayout()
+        if self._has_stamina:
+            self._place_stamina_window()
         # 快照可能刚建立 —— 托盘里「恢复上次设置」的置灰状态要跟着刷
         self._refresh_tray()
         # 位置真动过才闪「已重置」—— _tick 每秒刷状态栏,实际只亮 ~1 秒;
@@ -2086,7 +2978,7 @@ class SimpleGameTimer(object):
         # 2026-10-14 晚用户要求:原「已重置位置,可恢复」太长,缩短成「已重置」
         # (和「恢复上次设置」闪「已恢复」是同一批改动)。
         self.status_label.config(
-            text="已重置" if cur != default_pos else "已在默认位置")
+            text="已重置" if moved else "已在默认位置")
         self.root.after(1500, self._update_status_label)
 
     def _prev_settings_path(self):
@@ -2165,16 +3057,38 @@ class SimpleGameTimer(object):
         self._capturing = None
         if not action:
             return
-        self.cfg.set("Hotkeys", action, spec)
+        # 热键存 [Hotkeys] <action>;体力键存 [Stamina] <key_xxx>,靠行上的
+        # section / config_key 区分(见 _build_hotkey_row)
+        r = self._hotkey_rows.get(action) or {}
+        section = r.get("section", "Hotkeys")
+        ckey = r.get("config_key", action)
+        self.cfg.set(section, ckey, spec)
         self.cfg.save()
         self.hotkeys = self._load_hotkeys()
+        self._load_stamina_keys()
         self._refresh_hotkey_list()
+        # 键位重复是**能跑但一定算错**的那种错(比如「归满」设成 W,
+        # 一往前走就自动补体力)。不拦,但当场说一句。
+        # 2026-11-08:固定键撤出设置面板后,这里改成跟**固定键**和 [Hotkeys] 比。
+        warn = ""
+        if section == "Stamina":
+            up = spec.strip().upper()
+            for k2, name in STAM_FIXED_KEYS.items():
+                if up == name.upper():
+                    warn = "  (和固定键「{}」重复)".format(
+                        STAM_FIXED_LABELS.get(k2, name))
+                    break
+            if not warn:
+                for a2, lab2 in HOTKEY_LABELS.items():
+                    if (self.cfg.get("Hotkeys", a2) or "").strip().upper() == up:
+                        warn = "  (和「{}」重复)".format(lab2)
+                        break
         if self._hotkey_hint is not None:
             try:
-                self._hotkey_hint.set("已设为 {}".format(spec))
+                self._hotkey_hint.set("已设为 {}{}".format(spec, warn))
             except tk.TclError:
                 pass
-        self.status_label.config(text="已设为 {}".format(spec))
+        self.status_label.config(text="已设为 {}{}".format(spec, warn))
         self.root.after(1500, self._update_status_label)
 
     # ==================================================================
@@ -2182,6 +3096,26 @@ class SimpleGameTimer(object):
         self.root.mainloop()
 
 
-if __name__ == "__main__":
+def main(mode=None):
+    """程序入口。三个入口脚本各传一个模式(见模块顶上的 APP_MODE);开发态
+    `python timer.py` 不传 = 二合一。"""
+    global APP_MODE
+    if mode in MODE_TITLES:
+        APP_MODE = mode
     _ensure_admin()
+    inst = _single_instance_guard()
+    if inst is False:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "{} 已经在运行了。\n\n这次不会再开第二个,免得留下重复的托盘图标。\n"
+                "要重启到新版,请运行:\nE:\\Claude code\\restart_timer.ps1(需管理员)".format(_app_title()),
+                _app_title(), 0x00000040)
+        except Exception:
+            pass
+        sys.exit(0)
     SimpleGameTimer().run()
+
+
+if __name__ == "__main__":
+    main()

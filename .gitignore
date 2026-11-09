@@ -1,8 +1,12 @@
 # 打包产物
 build/
 dist/
+恐鬼症工具*/
+# 2026-11-09 改名前的旧成品目录（留着兼容）
 计时器 v*/
 timer.exe
+stamina.exe
+tools.exe
 
 # Python
 __pycache__/
@@ -14,6 +18,9 @@ __pycache__/
 config.ini
 config.ini.old
 FILE_INDEX.md
+测试记录.md
+# 发版用的截图素材 / 本机测试记录,只在本地
+docs/
 
 # 编辑器
 .vscode/
