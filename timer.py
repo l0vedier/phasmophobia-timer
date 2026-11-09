@@ -183,6 +183,7 @@ HOTKEY_DESCRIPTIONS = [
     ("stopwatch_start", "启动秒表"),
     ("toggle_stopwatch_view", "切换主显示 / 秒表显示"),
     ("close", "关闭程序"),
+    ("toggle_touch", "禁用 / 恢复触摸板(屏)"),
     ("click_second", "启动第二计时器"),
     ("click_reset", "重置并重开主计时器"),
 ]
@@ -204,7 +205,7 @@ HOTKEY_GROUPS = [
     ("计时器", ("toggle_active", "reset_second", "pause_resume")),
     ("秒表", ("toggle_stopwatch_active", "stopwatch_start", "toggle_stopwatch_view")),
     ("鼠标", ("click_second", "click_reset")),
-    ("程序", ("close",)),
+    ("程序", ("close", "toggle_touch")),
 ]
 
 HOTKEY_LABELS = dict(HOTKEY_DESCRIPTIONS)
@@ -360,6 +361,9 @@ DEFAULTS = {
         # 鼠标键没有修饰键,写成一个不带 `+` 的基名 —— 见 base_mouse_name()
         "click_second": "MOUSE_LEFT",
         "click_reset": "MOUSE_RIGHT",
+        # 2026-11-09 用户点名「游玩时老是碰到触摸板/屏」:一键临时停用,
+        # 退出工具时自动恢复(见 close_program)。默认 F8 —— F7 是体力归满。
+        "toggle_touch": "F8",
     },
     "Stamina": {
         # 1 = 显示体力条浮窗;0 = 隐藏(托盘菜单「显示体力条」改的就是这个)
@@ -606,6 +610,206 @@ def _single_instance_guard():
             pass
         time.sleep(0.1)
     return False
+
+
+# ----------------------------------------------------------------------
+# 触摸板 / 触摸屏开关(2026-11-09 用户点名;当天换过两次实现,最终 = 停用设备)
+# ----------------------------------------------------------------------
+# 用户原话:「游玩恐鬼症的时候老是会碰到触摸屏(板),但除了游玩游戏时其他时候
+# 还是会使用到触摸屏的」—— 要一个临时关掉、玩完再开回来的开关。
+# **只做进二合一「恐鬼症工具」**(用户:「只需要做工具的,其他的不用增加这个功能」)。
+#
+# 走过的弯路,别再重复:
+# 1. 改 HKCU\\...\\CurrentVersion\\PrecisionTouchPad\\LeaveOnWithMouse
+#    (= 设置里「连接鼠标时保持触摸板打开」): 值写得进去,但 Windows **只在
+#    登录时读**,运行中改不生效(2026-11-09 实测写成 0 后触摸板照常能用),弃。
+# 2. PowerShell 的 Get-PnpDevice / Disable-PnpDevice: 本机提权后会卡死在
+#    Get-PnpDevice 里不返回,弃。
+# 最终: 在进程里直接调 SetupAPI 停用/启用 HID 设备(同步、毫秒级返回)。
+#
+# 匹配按名字:本机是 `HID\ELAN0662&COL03`「符合 HID 标准的触摸板」。
+# 只关这一类,不去动父设备(同复合设备下还有鼠标/厂商集合)。
+# ⚠️ 停用/启用会让 Windows 重载触摸板驱动,重新启用后手感可能要缓一阵 ——
+#    用户知道并接受(2026-11-09 选定本方案)。
+TOUCH_NAME_HINTS = ("触摸屏", "触控屏", "触摸板",
+                    "touch screen", "touchscreen", "touch pad", "touchpad")
+
+_DIGCF_PRESENT = 0x02
+_DIGCF_ALLCLASSES = 0x04
+_SPDRP_DEVICEDESC = 0x00
+_SPDRP_FRIENDLYNAME = 0x0C
+_DIF_PROPERTYCHANGE = 0x12
+_DICS_ENABLE = 0x01
+_DICS_DISABLE = 0x02
+_DICS_FLAG_GLOBAL = 0x01
+_DICS_FLAG_CONFIGSPECIFIC = 0x02
+_DN_HAS_PROBLEM = 0x00000400
+_CM_PROB_DISABLED = 22
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("ClassGuid", _GUID),
+                ("DevInst", ctypes.c_ulong), ("Reserved", ctypes.c_void_p)]
+
+
+class _SP_CLASSINSTALL_HEADER(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("InstallFunction", ctypes.c_ulong)]
+
+
+class _SP_PROPCHANGE_PARAMS(ctypes.Structure):
+    _fields_ = [("ClassInstallHeader", _SP_CLASSINSTALL_HEADER),
+                ("StateChange", ctypes.c_ulong), ("Scope", ctypes.c_ulong),
+                ("HwProfile", ctypes.c_ulong)]
+
+
+def _touch_sp():
+    """setupapi 句柄 + 参数类型。不写 argtypes 的话 64 位下指针会被截成 int。"""
+    sp = ctypes.WinDLL("setupapi", use_last_error=True)
+    sp.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                        ctypes.c_void_p, ctypes.c_ulong]
+    sp.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    sp.SetupDiEnumDeviceInfo.argtypes = [ctypes.c_void_p,
+                                         ctypes.c_ulong,
+                                         ctypes.POINTER(_SP_DEVINFO_DATA)]
+    sp.SetupDiEnumDeviceInfo.restype = ctypes.c_bool
+    sp.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_SP_DEVINFO_DATA), ctypes.c_ulong,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong)]
+    sp.SetupDiGetDeviceRegistryPropertyW.restype = ctypes.c_bool
+    sp.SetupDiSetClassInstallParamsW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_SP_DEVINFO_DATA),
+        ctypes.POINTER(_SP_PROPCHANGE_PARAMS), ctypes.c_ulong]
+    sp.SetupDiSetClassInstallParamsW.restype = ctypes.c_bool
+    sp.SetupDiCallClassInstaller.argtypes = [ctypes.c_ulong, ctypes.c_void_p,
+                                             ctypes.POINTER(_SP_DEVINFO_DATA)]
+    sp.SetupDiCallClassInstaller.restype = ctypes.c_bool
+    sp.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+    sp.SetupDiDestroyDeviceInfoList.restype = ctypes.c_bool
+    return sp
+
+
+def _dev_friendly_name(sp, h, dev):
+    buf = ctypes.create_unicode_buffer(512)
+    need = ctypes.c_ulong()
+    for prop in (_SPDRP_FRIENDLYNAME, _SPDRP_DEVICEDESC):
+        ok = sp.SetupDiGetDeviceRegistryPropertyW(
+            h, ctypes.byref(dev), prop, None, buf, ctypes.sizeof(buf),
+            ctypes.byref(need))
+        if ok and buf.value:
+            return buf.value
+    return ""
+
+
+def _dev_disabled(devinst):
+    """按 CM_Get_DevNode_Status 判「被停用」—— 别靠我们自己记的布尔值,
+    进程可能在别处被停用/启用(设备管理器、上次崩溃没恢复)。"""
+    try:
+        cfg = ctypes.WinDLL("cfgmgr32")
+        status = ctypes.c_ulong()
+        problem = ctypes.c_ulong()
+        r = cfg.CM_Get_DevNode_Status(ctypes.byref(status), ctypes.byref(problem),
+                                      ctypes.c_ulong(devinst), ctypes.c_ulong(0))
+        if r != 0:
+            return False
+        return bool(status.value & _DN_HAS_PROBLEM) and problem.value == _CM_PROB_DISABLED
+    except Exception:
+        return False
+
+
+def _touch_scan():
+    """列出触摸屏/触摸板:[(显示名, devinst, 是否已停用)]。纯查询,不改任何东西。"""
+    out = []
+    try:
+        sp = _touch_sp()
+        h = sp.SetupDiGetClassDevsW(None, None, None, _DIGCF_PRESENT | _DIGCF_ALLCLASSES)
+        if not h or h == _INVALID_HANDLE:
+            return out
+        try:
+            dev = _SP_DEVINFO_DATA()
+            dev.cbSize = ctypes.sizeof(dev)
+            i = 0
+            while sp.SetupDiEnumDeviceInfo(h, i, ctypes.byref(dev)):
+                name = _dev_friendly_name(sp, h, dev)
+                low = name.lower()
+                if any(k.lower() in low for k in TOUCH_NAME_HINTS):
+                    out.append((name, int(dev.DevInst), _dev_disabled(dev.DevInst)))
+                i += 1
+        finally:
+            sp.SetupDiDestroyDeviceInfoList(h)
+    except Exception:
+        pass
+    return out
+
+
+def _touch_apply(disabled):
+    """停用 / 恢复所有触摸屏/触摸板设备。返回成功的设备数(0 = 没找到或全失败)。
+
+    本机实测:停用走 DICS_FLAG_GLOBAL;恢复先 GLOBAL,不行再 CONFIGSPECIFIC
+    (有的 HID 驱动只认后者,只试一种会留下"关得掉、开不回来"的坑)。
+    """
+    done = 0
+    try:
+        sp = _touch_sp()
+        h = sp.SetupDiGetClassDevsW(None, None, None, _DIGCF_PRESENT | _DIGCF_ALLCLASSES)
+        if not h or h == _INVALID_HANDLE:
+            return 0
+        try:
+            dev = _SP_DEVINFO_DATA()
+            dev.cbSize = ctypes.sizeof(dev)
+            i = 0
+            while sp.SetupDiEnumDeviceInfo(h, i, ctypes.byref(dev)):
+                name = _dev_friendly_name(sp, h, dev)
+                low = name.lower()
+                if any(k.lower() in low for k in TOUCH_NAME_HINTS):
+                    scopes = (_DICS_FLAG_GLOBAL,) if disabled else (
+                        _DICS_FLAG_GLOBAL, _DICS_FLAG_CONFIGSPECIFIC)
+                    for scope in scopes:
+                        params = _SP_PROPCHANGE_PARAMS()
+                        params.ClassInstallHeader.cbSize = ctypes.sizeof(
+                            _SP_CLASSINSTALL_HEADER)
+                        params.ClassInstallHeader.InstallFunction = _DIF_PROPERTYCHANGE
+                        params.StateChange = _DICS_DISABLE if disabled else _DICS_ENABLE
+                        params.Scope = scope
+                        params.HwProfile = 0
+                        ok = sp.SetupDiSetClassInstallParamsW(
+                            h, ctypes.byref(dev), ctypes.byref(params),
+                            ctypes.sizeof(params))
+                        if ok:
+                            ok = sp.SetupDiCallClassInstaller(
+                                _DIF_PROPERTYCHANGE, h, ctypes.byref(dev))
+                        if ok and _dev_disabled(dev.DevInst) == bool(disabled):
+                            done += 1
+                            break
+                i += 1
+        finally:
+            sp.SetupDiDestroyDeviceInfoList(h)
+    except Exception:
+        pass
+    return done
+
+
+def _touch_any_disabled():
+    try:
+        return any(d for _n, _i, d in _touch_scan())
+    except Exception:
+        return False
+
+
+def _is_admin():
+    """停用设备 = 系统级操作。2026-11-10 实测:非管理员进程调
+    SetupDiCallClassInstaller 返回 False 且设备状态不变(而 GetLastError 还是 0,
+    很容易被误判成"成功了")。成品用 --uac-admin 启动,这里只做兜底提示。"""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def _set_timer_precision(hi_res):
@@ -988,6 +1192,14 @@ class SimpleGameTimer(object):
         # stamina.ini / config.ini),互不干扰。旧版放在程序旁边的会被接过来一次
         cfg_path, self._config_migrated = _resolve_config_path()
         self.cfg = Config(cfg_path)
+
+        # ---- 触摸板 / 触摸屏 ----
+        # 2026-11-09 用户定:**只做进二合一「恐鬼症工具」**,独立计时器 /
+        # 体力条不出现这个功能 —— 那两套里 _touch_off 恒为 False,
+        # 托盘项、改键行、F8 派发都按 self.mode 挡住(见 toggle_touch)。
+        self._touch_off = _touch_any_disabled() if self.mode == "both" else False
+        self._stam_flash = None      # (文字, 到期时间戳) —— 体力条临时提示
+        self._flash_until = 0.0      # 状态栏提示语的截止时间(挡 _tick 的重画)
 
         # ---- 运行状态 ----
         self.active = True
@@ -1521,6 +1733,9 @@ class SimpleGameTimer(object):
             self._phase_text = self.PHASE_ATTACK if cycle % 2 == 0 else self.PHASE_CALM
 
     def _update_status_label(self):
+        # 提示语(_flash_status)没到期之前不许重画,否则 _tick 下一帧就把它抹掉
+        if self._flash_until > time.monotonic():
+            return
         if self._capturing:
             self.status_label.config(text="请按键…")
         elif self.state == "paused" and not self.force_hide_pause_text:
@@ -1813,7 +2028,11 @@ class SimpleGameTimer(object):
         # 状态文字从底部挪到右上,和左边「体力」同一行;下面只留三段条子。
         # 状态加粗 —— 同样字号下细体在 150% 缩放下发虚,加粗后边缘干净很多。
         # ⚠️ 字体族没换(用户说「字体先不改」),仍是 FONT_FAMILY_STATUS。
-        if self.edit_mode:
+        flash = getattr(self, "_stam_flash", None)
+        if flash and time.time() < flash[1]:
+            # 热键切换触摸板时的临时提示(纯体力条工具没有状态栏可闪)
+            text, tcol = flash[0], HK_ACCENT
+        elif self.edit_mode:
             text, tcol = "编辑中", HK_ACCENT
         else:
             text, tcol = self._stam_state_text()
@@ -2011,6 +2230,7 @@ class SimpleGameTimer(object):
             "stopwatch_start": self.handle_stopwatch_start,
             "toggle_stopwatch_view": self.handle_stopwatch_view,
             "close": self.close_program,
+            "toggle_touch": self.toggle_touch,
             "click_second": self.handle_left_click_timer2,
             "click_reset": self.handle_right_click,
         }.get(action)
@@ -2222,6 +2442,16 @@ class SimpleGameTimer(object):
         # 处理那条消息进程就没了 —— Explorer 那边就留一个没有进程的图标壳,
         # **每次退出都留一个**,攒着就是"托盘里一堆计时器"。
         # 修法:停之前先拿到托盘线程,退出前 join 一下,等 NIM_DELETE 走完。
+        #
+        # 2026-11-09:触摸板开关如果被按过(=HID 设备被停用了),退出前**必须**
+        # 重新启用,不然下次用触摸板会以为坏了。放最前面 —— 后面的托盘收尾、
+        # 销毁窗口都可能抛异常,一旦抛在前面设备就留成停用状态。
+        try:
+            if self._touch_off:
+                _touch_apply(False)
+                self._touch_off = False
+        except Exception:
+            pass
         tray_thread = None
         try:
             if self._tray:
@@ -2388,6 +2618,13 @@ class SimpleGameTimer(object):
             items.append(
                 pystray.MenuItem("显示体力条", lambda: self._tray_call(self._toggle_stamina),
                                  checked=lambda item: bool(self.cfg.get_int("Stamina", "enabled"))))
+        # 2026-11-09 用户点名:玩游戏时老是误碰触摸板/屏,要能临时关掉再开回来。
+        # 只做进二合一(用户点名「只需要做工具的,其他的不用增加这个功能」)。
+        # checked 和别的勾一样是**重建菜单时**求值,toggle 完要 _refresh_tray。
+        if self.mode == "both":
+            items.append(
+                pystray.MenuItem("禁用触摸板(屏)", lambda: self._tray_call(self.toggle_touch),
+                                 checked=lambda item: self._touch_off))
         items.append(pystray.Menu.SEPARATOR)
         # 2026-10-14 起「透明度…」和「修改热键…」合并成一个窗口 ——
         # 里面分区:外观(透明度/字号)、计时(上限)、体力条、热键。没建的东西不显示。
@@ -2418,6 +2655,61 @@ class SimpleGameTimer(object):
 
         self._tray = pystray.Icon("PhasmoTools", image, _app_title(), menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 触摸板 / 触摸屏开关(2026-11-09 用户点名)
+    # ------------------------------------------------------------------
+    def toggle_touch(self):
+        if self.mode != "both":
+            # 独立计时器 / 体力条没有这个功能(2026-11-09 用户点名只做二合一)
+            return
+        self._set_touch_disabled(not self._touch_off)
+
+    def _set_touch_disabled(self, off):
+        """off=True 停用触摸板/触摸屏设备(鼠标不受影响),False 重新启用。
+
+        返回是否成功。按设备状态实测判定,**不信"调用没报错"** —— 关不掉
+        却以为关了,用户下次上手就是一肚子火。
+        停用/启用会让 Windows 重载触摸板驱动,启用后手感要缓一阵(用户知道)。
+        """
+        if off and not _is_admin():
+            self._flash_status("需要管理员权限", 2600)
+            return False
+        ok = _touch_apply(bool(off)) > 0
+        if ok:
+            self._touch_off = bool(off)
+            self._flash_status("触摸板已禁用" if off else "触摸板已恢复")
+        else:
+            self._flash_status("切换失败")
+        self._refresh_tray()
+        return ok
+
+    def _flash_status(self, text, ms=1600):
+        """闪一句提示:有计时器就写状态栏,纯体力条就画在条子上。
+
+        ⚠️ `_tick` 每帧都会调 `_update_status_label()` 把状态栏重画一遍,只写
+        一下 config 的话提示语会被**下一帧立刻抹掉** —— 用户看到的是"字样一闪
+        就没了"(2026-11-10 F8 实测)。所以用一个截止时间挡住重画。
+        """
+        try:
+            if self._has_timer:
+                self._flash_until = time.monotonic() + ms / 1000.0
+                self.status_label.config(text=text)
+                self.root.after(ms + 40, self._flash_done)
+            elif self._stam_win is not None:
+                self._stam_flash = (text, time.time() + ms / 1000.0)
+                self._draw_stamina()
+                self.root.after(ms + 150, self._draw_stamina)
+        except Exception:
+            pass
+
+    def _flash_done(self):
+        """提示语到期,交回正常状态文字。"""
+        self._flash_until = 0.0
+        try:
+            self._update_status_label()
+        except Exception:
+            pass
 
     def _toggle_edit_mode(self):
         if self.edit_mode:
@@ -2462,6 +2754,12 @@ class SimpleGameTimer(object):
             covered.update(acts)
         leftover = tuple(a for a, _ in HOTKEY_DESCRIPTIONS if a not in covered)
         groups = list(HOTKEY_GROUPS) + ([("其它", leftover)] if leftover else [])
+        if self.mode != "both":
+            # 触摸板开关只做进二合一(2026-11-09 用户点名),独立计时器 /
+            # 体力条的设置窗口里连这一行都不出现。
+            groups = [(cap, tuple(a for a in acts if a != "toggle_touch"))
+                      for cap, acts in groups]
+            groups = [(cap, acts) for cap, acts in groups if acts]
 
         # 无边框窗口:系统标题栏、关闭按钮、窗口阴影全都没有,全得自己画。
         # win 自己的底色当 1px 外框,body 再缩进 1px —— 不留这一圈描边的话,
