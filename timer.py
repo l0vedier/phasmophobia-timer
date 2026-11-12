@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import zlib
 
 from PIL import Image
 import pystray
@@ -95,9 +96,9 @@ SNAPSHOT_GAP_S = 120.0
 # 完整路径拼法 + 旧版配置的一次性迁移见 _resolve_config_path()。
 APP_DATA_DIRNAME = "PhasmophobiaTimer"
 ICON_FILENAME = "ghost_icon.ico"
-# 使用说明。**放在 exe 旁边**(不是塞进 _internal),这样改了不用重新打包。
-# ⚠️ 打包时别忘了把它拷进成品目录 —— 漏了菜单项就是个死键。
-MANUAL_FILENAME = "使用说明.md"
+# 使用说明.md 就摊在 exe 旁边(打包第 3 步 cp 进去),用户自己双击看。
+# 2026-11-13 用户点名把托盘里的「使用说明」也删了 —— 所以代码里不再有
+# MANUAL_FILENAME / _open_manual,别为了"方便"再加回来。
 
 # F2「偷看」的亮起时长(秒):计时中虚化着按 F2 脱离虚化看一眼,期间没再按 F2,
 # 到点自动回灰。2026-10-15 用户定稿——现在只有偷看走这个倒计时;「等待左键」
@@ -472,6 +473,18 @@ def _config_dir():
     return os.path.join(base, APP_DATA_DIRNAME)
 
 
+def _reset_flag_path(mode):
+    """「重置窗口位置.bat」留下的标记文件路径(2026-11-13)。
+
+    原来这是托盘里的一项;用户点名挪到 exe 旁边后,那个 bat **只往这儿写一个
+    标记**,程序每秒看一眼:有就删掉标记、走一遍 _reset_position()。
+    不直接改 ini —— 改文件会跟程序每秒的保存撞车,还很容易写出带 BOM 的
+    UTF-8(程序按 utf-8 读,带 BOM 会连节名都认不出)。
+    文件名带模式后缀:三个工具共用一个配置目录,谁家 bat 写的就只由谁家消费。
+    """
+    return os.path.join(_config_dir(), "reset_position.%s.flag" % mode)
+
+
 def _resolve_config_path():
     """定下配置文件的最终路径,顺带做旧位置的一次性迁移。
 
@@ -752,11 +765,27 @@ def _touch_scan():
     return out
 
 
+def _wait_dev_state(devinst, want_disabled, timeout=1.2):
+    """等设备状态真的变成 want_disabled(最多 timeout 秒)。
+
+    2026-11-13:驱动重载是稍后完成的,调用刚返回时查状态可能还是旧的 ——
+    立刻判死会把「其实关掉了」记成失败,界面上又报「切换失败」。
+    """
+    t0 = time.time()
+    while True:
+        if _dev_disabled(devinst) == bool(want_disabled):
+            return True
+        if time.time() - t0 >= timeout:
+            return False
+        time.sleep(0.05)
+
+
 def _touch_apply(disabled):
     """停用 / 恢复所有触摸屏/触摸板设备。返回成功的设备数(0 = 没找到或全失败)。
 
-    本机实测:停用走 DICS_FLAG_GLOBAL;恢复先 GLOBAL,不行再 CONFIGSPECIFIC
-    (有的 HID 驱动只认后者,只试一种会留下"关得掉、开不回来"的坑)。
+    本机实测:两种 scope 都试(GLOBAL 优先,不行再 CONFIGSPECIFIC)——
+    有的 HID 驱动只认后者,只试一种会留下"关得掉、开不回来"(或反过来)的坑。
+    以前停用只试 GLOBAL,2026-11-13 遇到"停用返回 0、触摸板照常能用"就是这条。
     """
     done = 0
     try:
@@ -772,9 +801,7 @@ def _touch_apply(disabled):
                 name = _dev_friendly_name(sp, h, dev)
                 low = name.lower()
                 if any(k.lower() in low for k in TOUCH_NAME_HINTS):
-                    scopes = (_DICS_FLAG_GLOBAL,) if disabled else (
-                        _DICS_FLAG_GLOBAL, _DICS_FLAG_CONFIGSPECIFIC)
-                    for scope in scopes:
+                    for scope in (_DICS_FLAG_GLOBAL, _DICS_FLAG_CONFIGSPECIFIC):
                         params = _SP_PROPCHANGE_PARAMS()
                         params.ClassInstallHeader.cbSize = ctypes.sizeof(
                             _SP_CLASSINSTALL_HEADER)
@@ -788,7 +815,8 @@ def _touch_apply(disabled):
                         if ok:
                             ok = sp.SetupDiCallClassInstaller(
                                 _DIF_PROPERTYCHANGE, h, ctypes.byref(dev))
-                        if ok and _dev_disabled(dev.DevInst) == bool(disabled):
+                        # 调用没报错也照样等状态落定 —— 只认设备状态,不信返回值
+                        if ok and _wait_dev_state(dev.DevInst, disabled):
                             done += 1
                             break
                 i += 1
@@ -797,6 +825,23 @@ def _touch_apply(disabled):
     except Exception:
         pass
     return done
+
+
+def _touch_apply_retry(disabled, tries=3):
+    """失败就隔一会儿再试,最多 tries 轮。返回成功的设备数。
+
+    2026-11-13 实测:同一次停用,平时 0.05 秒就成,但偶尔会卡 5.5 秒才失败
+    (设备正被驱动/输入占用时,系统等它停下等到超时)。那一次失败不代表
+    真关不掉 —— 隔半秒重来通常就过了。重试放在后台线程里跑,不卡界面。
+    """
+    n = 0
+    for i in range(max(1, tries)):
+        n = _touch_apply(disabled)
+        if n > 0:
+            return n
+        if i + 1 < tries:
+            time.sleep(0.5 * (i + 1))
+    return n
 
 
 def _touch_any_disabled():
@@ -862,6 +907,72 @@ class Config(object):
         # 首次运行就把文件落盘,否则你根本找不到 config.ini 去手改
         if not os.path.exists(self.path):
             self.save()
+        else:
+            # 2026-11-13 晚:上次是"恢复"完直接关的程序 → 这次接着往回退。
+            # 层数存在配置文件旁边的 `<名字>.restore` 里,连同当时文件的指纹,
+            # **别再靠"内容等于哪个快照"去猜**(见 _load_restore_state)。
+            self.restore_depth = self._load_restore_state()
+
+    # ---------- 「恢复上次设置」退到第几层(重启后接着退) ----------
+    def _restore_state_path(self):
+        """层数小状态文件:`config.ini.restore` / `timer.ini.restore` …"""
+        return self.path + ".restore"
+
+    def _file_sig(self):
+        """配置文件的指纹,用来确认状态文件里的层数说的就是现在这份内容。
+
+        手改过配置、从别的机器拷了配置过来 → 指纹对不上 → 层数作废,
+        从"现在"重新开始退(总比退到一个八竿子打不着的快照上强)。
+        ⚠️ 用 `zlib.crc32` 而不是 `hashlib` —— 打包命令里 `--exclude-module hashlib`
+        为了体积把 hashlib 排掉了,真用上会 ImportError。zlib 是 PIL 的依赖,
+        本来就在包里。指纹 = 长度 + CRC32,对"配没被改过"这件事足够。
+        """
+        try:
+            with open(self.path, "rb") as f:
+                data = f.read()
+            return "%d:%08x" % (len(data), zlib.crc32(data) & 0xFFFFFFFF)
+        except OSError:
+            return ""
+
+    def _load_restore_state(self):
+        """读回"上次退到第几层",对不上指纹就是 0。
+
+        ⚠️ 2026-11-13 晚换掉旧做法:以前是拿当前内容和 1~5 号快照逐字节比对,
+        取第一个相同的当成层数。快照里本来就有大量重复内容(旧版空保存留下的、
+        或者"重置回默认位置"绕一圈又回到起点),于是启动就猜错 —— 用户实测
+        连点两次「恢复上次设置」,第二次把第一次的恢复给撤了(往前跳):
+        猜出的层数偏后,中间只要有一次真保存(轮转 + 归零),下一次恢复就会
+        落到比刚才**更新**的那一层。现在记多少就是多少,指纹只负责确认没过期。
+        """
+        try:
+            with open(self._restore_state_path(), encoding="utf-8") as f:
+                depth_s, sig = f.read().split("\n")[:2]
+            depth = int(depth_s)
+        except (OSError, ValueError):
+            return 0
+        if sig.strip() != self._file_sig():
+            return 0
+        return max(0, min(depth, CONFIG_PREV_SLOTS))
+
+    def set_restore_depth(self, depth):
+        """改「恢复」层数并落盘(0 = 回到现在,顺手删掉状态文件)。"""
+        self.restore_depth = int(depth)
+        if self.restore_depth <= 0:
+            self.clear_restore_state()
+            return
+        try:
+            tmp = self._restore_state_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write("%d\n%s\n" % (self.restore_depth, self._file_sig()))
+            os.replace(tmp, self._restore_state_path())
+        except OSError:
+            pass
+
+    def clear_restore_state(self):
+        try:
+            os.remove(self._restore_state_path())
+        except OSError:
+            pass
 
     # ---------- 读 ----------
     def load(self):
@@ -927,15 +1038,43 @@ class Config(object):
         # 先刷再写(「重置窗口位置」和"退回后再动手改"的第一次保存,见那两处)。
         # ⚠️ "上次保存时刻"直接用 config.ini 的 mtime,别另存状态变量 ——
         #    重启、外部改了文件之后照样对。
+        #
+        # 2026-11-13 修:「恢复上次设置」点着像坏的,根子是**空保存**。
+        # 进出编辑模式没挪窗口、滚轮到上限继续滚、点 + 又点 − —— 这些地方都会
+        # 调 save(),但一个值都没变。以前它们照样**重写文件**(刷 mtime,把"一段
+        # 调整"的计时重置)并且**占一个快照槽**(隔 2 分钟以上就轮转一次)。
+        # 实测:真改动 1 次 + 之后 6 次隔 2 分钟的空保存 → 5 个槽全变成同一份
+        # 当前状态,唯一的真还原点被挤掉,点「恢复上次设置」纹丝不动。
+        # 现在两条都堵死:
+        #   ① 渲染出来的文本和盘上一模一样 → 直接返回,不写、不轮转、
+        #      也**不清** pending_snapshot / restore_depth(什么都没改,还算同一段);
+        #   ② 真要写时,1 号槽的内容已经等于盘上这份 → 也不用再轮转,
+        #      别拿重复内容把老历史挤出去。
+        text = self._render()
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                old = f.read()
+        except (OSError, UnicodeDecodeError):
+            old = None
+        if text == old:
+            return                  # 空保存:见上面 ①
         force = force_snapshot or self.pending_snapshot
         self.pending_snapshot = False
         self.restore_depth = 0      # 动过手保存 = 回到"现在",「恢复」下次从 1 号退起
+        self.clear_restore_state()  # 重启后也别接着退:已经动过手了
         try:
             if os.path.exists(self.path):
                 s1 = _prev_slot_path(self.path, 1)
                 created = not os.path.exists(s1)
-                if (created or force
-                        or time.time() - os.path.getmtime(self.path) >= SNAPSHOT_GAP_S):
+                same = False
+                if not created:
+                    try:
+                        with open(s1, encoding="utf-8") as f:
+                            same = f.read() == old
+                    except (OSError, UnicodeDecodeError):
+                        same = False
+                if (not same and (created or force
+                                  or time.time() - os.path.getmtime(self.path) >= SNAPSHOT_GAP_S)):
                     # 轮转:最老的删掉,其余往后挪一格,给"保存前"腾出 1 号
                     oldest = _prev_slot_path(self.path, CONFIG_PREV_SLOTS)
                     if os.path.exists(oldest):
@@ -950,12 +1089,26 @@ class Config(object):
         except OSError:
             pass
 
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            os.replace(tmp, self.path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        self.mtime = self._disk_mtime()
+
+    def _render(self):
+        """把当前 parser 渲染成整份文本(逐行合并,保留用户注释和顺序)。"""
         lines = []
         if os.path.exists(self.path):
             try:
                 with open(self.path, encoding="utf-8") as f:
                     lines = f.read().splitlines()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 lines = []
 
         head, sections, order = [], {}, []
@@ -1002,17 +1155,7 @@ class Config(object):
                 if key not in written:
                     out.append("{} = {}".format(key, self.parser.get(sec, key)))
 
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                f.write("\n".join(out).rstrip() + "\n")
-            os.replace(tmp, self.path)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        self.mtime = self._disk_mtime()
+        return "\n".join(out).rstrip() + "\n"
 
 
 # ----------------------------------------------------------------------
@@ -1202,8 +1345,11 @@ class SimpleGameTimer(object):
         # 体力条不出现这个功能 —— 那两套里 _touch_off 恒为 False,
         # 托盘项、改键行、F8 派发都按 self.mode 挡住(见 toggle_touch)。
         self._touch_off = _touch_any_disabled() if self.mode == "both" else False
+        self._touch_busy = False     # 后台线程正在停用/恢复,挡住连点重复派活
+        self._touch_result = None    # 后台线程的结果 (off, ok),由 _tick 取走
         self._stam_flash = None      # (文字, 到期时间戳) —— 体力条临时提示
         self._flash_until = 0.0      # 状态栏提示语的截止时间(挡 _tick 的重画)
+        self._flash_seq = 0          # 连闪两句时,只让最后那句的 _flash_done 生效
 
         # ---- 运行状态 ----
         self.active = True
@@ -1295,12 +1441,11 @@ class SimpleGameTimer(object):
         self.root.protocol("WM_DELETE_WINDOW", self.close_program)
         self._tick()
 
-        # 旧版配置刚从程序旁边搬过来 —— 状态栏提一句。和 _open_manual 的
-        # "没找到 使用说明.md" 同款:_tick 每秒会刷新状态栏,实际只亮 ~1 秒,
-        # after 只是兜底收尾,别指望它把提示按住。
+        # 旧版配置刚从程序旁边搬过来 —— 状态栏提一句。_tick 每秒会刷新状态栏,
+        # 直接 config(text=...) 只亮 ~1 秒,after 只是兜底收尾;
+        # 想真按住得用 _flash_status。
         if self._config_migrated:
-            self.status_label.config(text="设置已迁移到新位置")
-            self.root.after(2500, self._update_status_label)
+            self._flash_status("设置已迁移到新位置", 2500)
 
     # ==================================================================
     # 配置
@@ -1365,29 +1510,8 @@ class SimpleGameTimer(object):
         if was_editing:
             self._enter_edit_mode()
 
-    def _open_config(self):
-        try:
-            os.startfile(self.cfg.path)
-        except Exception:
-            pass
-
-    def _open_manual(self):
-        """打开使用说明。
-
-        用 _resource_path 而不是直接拼 _app_dir():它先找 _MEIPASS 再找 exe 目录,
-        文档放哪一层都能找到 —— 和托盘图标一个路子(见 _start_tray)。
-        找不到时在状态栏闪一句。**不能静默返回** —— 点了菜单什么都没发生,
-        用的人只会以为程序坏了,而真正的原因是打包时漏拷了文档。
-        """
-        path = _resource_path(MANUAL_FILENAME)
-        if not os.path.exists(path):
-            self.status_label.config(text="没找到 " + MANUAL_FILENAME)
-            self.root.after(1500, self._update_status_label)
-            return
-        try:
-            os.startfile(path)
-        except Exception:
-            pass
+    # 2026-11-13:「使用说明」托盘项连同 _open_manual() 一起删了(用户点名)。
+    # 说明文档一直在 exe 旁边,双击就开,不需要程序代劳。
 
     # ==================================================================
     # 窗口与样式
@@ -1655,6 +1779,16 @@ class SimpleGameTimer(object):
                 self._reload_from_disk()
         except Exception:
             pass
+
+        # 「重置窗口位置.bat」留的标记(见 _reset_flag_path)。放在
+        # not self._has_timer 那条早退之前 —— 体力条工具也要能重置。
+        if self._consume_reset_flag():
+            self._reset_position()
+
+        # 触摸板开关的后台线程(见 _set_touch_disabled)。结果靠这里取回来,
+        # **不从后台线程直接碰 Tk** —— 跨线程调 root.after 在 mainloop 里能用,
+        # 但在 update() 驱动(测试)时会静默失败,而且本来就不是线程安全的。
+        self._poll_touch_result()
 
         # 捕获超时。走 _cancel_capture 而不是自己清 _capturing ——
         # 它顺便会把那一行的青色高亮撤掉(超时是三个出口里最容易被漏掉的那个)
@@ -2481,7 +2615,9 @@ class SimpleGameTimer(object):
         # 销毁窗口都可能抛异常,一旦抛在前面设备就留成停用状态。
         try:
             if self._touch_off:
-                _touch_apply(False)
+                # 只重试 2 次:退出本来就该利索,但也不能试一次失败就把
+                # 用户的触摸板留成停用状态(那下次开机就以为触摸板坏了)
+                _touch_apply_retry(False, tries=2)
                 self._touch_off = False
         except Exception:
             pass
@@ -2673,15 +2809,16 @@ class SimpleGameTimer(object):
             pystray.MenuItem("设置…", lambda: self._tray_call(self._open_hotkey_window)))
         items.append(pystray.Menu.SEPARATOR)
         items += [
-            # 2026-10-14 晚用户点名:重新载入配置要挪到打开配置文件**正下面**
-            # (原来在"使用说明"后面)—— 两个都是"跟配置文件打交道"的,挨着好找。
-            pystray.MenuItem("打开配置文件", lambda: self._tray_call(self._open_config)),
-            pystray.MenuItem("重新载入配置", lambda: self._tray_call(self._reload_from_disk)),
-            pystray.MenuItem("使用说明", lambda: self._tray_call(self._open_manual)),
-            # 「重置窗口位置」的撤销并进了下面「恢复上次设置」(重置走
-            # save(force_snapshot=True),快照必定是"点重置前一瞬间") ——
-            # 2026-10-14 晚用户点名:"包含的话就把恢复上次位置删了",已删。
-            pystray.MenuItem("重置窗口位置", lambda: self._tray_call(self._reset_position)),
+            # 2026-11-13 用户点名删掉「打开配置文件」「重新载入配置」两项:
+            # 配置放哪儿、怎么改自己心里有数,要看就双击 exe 旁边的
+            # 「打开配置文件.bat」;程序每秒自己检查文件变化,重载本来就不用点。
+            # ⚠️ _reload_from_disk 别删 —— 它是配置热重载的入口(_tick 会调)。
+            # _open_config 已随菜单项一起删掉,别为了"留个后门"又加回来。
+            # 同一天「使用说明」也删了(用户第二次点名),文档就在 exe 旁边,双击即开。
+            # 「重置窗口位置」第三次点名:**挪到 exe 旁边**的「重置窗口位置.bat」——
+            # bat 只写标记文件,程序在 _tick 里消费并走同一个 _reset_position()
+            # (顺手留快照、闪「已重置」,语义没变)。方法留着给标记用,别删。
+            # 于是 exe 旁边一共三个文件:使用说明.md / 打开配置文件.bat / 重置窗口位置.bat。
             # 整份设置的还原点 = 配置文件旁边的自动快照(五槽轮转:*.prev.ini
             # ~ *.prev5.ini,见 Config.save);点一次往回退一层,再点继续退。
             # 快照由"保存"创建,而菜单重建才刷新置灰:enabled 和上面的 checked 一样,
@@ -2751,21 +2888,56 @@ class SimpleGameTimer(object):
     def _set_touch_disabled(self, off):
         """off=True 停用触摸板/触摸屏设备(鼠标不受影响),False 重新启用。
 
-        返回是否成功。按设备状态实测判定,**不信"调用没报错"** —— 关不掉
-        却以为关了,用户下次上手就是一肚子火。
-        停用/启用会让 Windows 重载触摸板驱动,启用后手感要缓一阵(用户知道)。
+        ⚠️ 2026-11-13 改:**设备变更放到后台线程做**。
+        以前整段在 Tk 主线程里同步跑,而这条路偶尔会卡 5.5 秒才失败
+        (见 _touch_apply_retry),那 5.5 秒里整个界面冻住、勾也不动 ——
+        用户的原话是「没有用了,并且会卡住」。现在点完立刻闪「正在…」,
+        后台干完再切回主线程改状态,程序全程能点。
+        返回是否**已受理**(真正的结果看状态栏提示)。
         """
+        if self._touch_busy:
+            # 上一次还没回来(后台可能要重试两三秒),别排队堆一串 5 秒的活
+            self._flash_status("正在切换,稍等…", 1200)
+            return False
         if off and not _is_admin():
             self._flash_status("需要管理员权限", 2600)
             return False
-        ok = _touch_apply(bool(off)) > 0
+        self._touch_busy = True
+        self._flash_status("正在禁用触摸板…" if off else "正在恢复触摸板…", 5000)
+        off = bool(off)
+
+        def work():
+            try:
+                ok = _touch_apply_retry(off) > 0
+            except Exception:
+                ok = False
+            self._touch_result = (off, ok)     # 交给 _tick 取(别跨线程碰 Tk)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _poll_touch_result(self):
+        """_tick 里取后台线程的结果(没有就什么也不做)。"""
+        res = self._touch_result
+        if res is None:
+            return
+        self._touch_result = None
+        try:
+            self._touch_done(*res)
+        except Exception:
+            pass
+
+    def _touch_done(self, off, ok):
+        """后台线程干完,切回 Tk 主线程收尾(改状态 / 闪提示 / 刷新托盘勾)。"""
+        self._touch_busy = False
         if ok:
             self._touch_off = bool(off)
             self._flash_status("触摸板已禁用" if off else "触摸板已恢复")
         else:
-            self._flash_status("切换失败")
+            # 失败也别自作主张改 _touch_off:设备到底什么状态,_touch_scan 说了算
+            self._touch_off = _touch_any_disabled()
+            self._flash_status("切换失败,再点一次试试", 2600)
         self._refresh_tray()
-        return ok
 
     def _flash_status(self, text, ms=1600):
         """闪一句提示:有计时器就写状态栏,纯体力条就画在条子上。
@@ -2778,7 +2950,8 @@ class SimpleGameTimer(object):
             if self._has_timer:
                 self._flash_until = time.monotonic() + ms / 1000.0
                 self.status_label.config(text=text)
-                self.root.after(ms + 40, self._flash_done)
+                self._flash_seq += 1
+                self.root.after(ms + 40, lambda s=self._flash_seq: self._flash_done(s))
             elif self._stam_win is not None:
                 self._stam_flash = (text, time.time() + ms / 1000.0)
                 self._draw_stamina()
@@ -2786,8 +2959,14 @@ class SimpleGameTimer(object):
         except Exception:
             pass
 
-    def _flash_done(self):
-        """提示语到期,交回正常状态文字。"""
+    def _flash_done(self, seq=None):
+        """提示语到期,交回正常状态文字。
+
+        连点两下(比如「没有更早的设置」紧跟着「已恢复」)时,前一句的收尾
+        after 到点早了会把后一句提前清掉 —— 认一下序号,只让最新那句收尾。
+        """
+        if seq is not None and seq != self._flash_seq:
+            return
         self._flash_until = 0.0
         try:
             self._update_status_label()
@@ -3319,6 +3498,21 @@ class SimpleGameTimer(object):
                 bg=HK_ACCENT if cap else HK_CHIP_BG,
                 fg=HK_BG if cap else (HK_CHIP_TEXT if bound else HK_DIM))
 
+    def _consume_reset_flag(self):
+        """「重置窗口位置.bat」留了标记吗?有就吃掉并返回 True。
+
+        删标记失败(被占用 / 只读)就返回 False —— 宁可下一帧再试一次,
+        也不要重复重置把快照刷乱。
+        """
+        p = _reset_flag_path(self.mode)
+        try:
+            if not os.path.exists(p):
+                return False
+            os.remove(p)
+            return True
+        except OSError:
+            return False
+
     def _reset_position(self):
         """把浮窗挪回默认位置;这一步永远留一个还原点,「恢复上次设置」能精确撤回。
 
@@ -3354,13 +3548,10 @@ class SimpleGameTimer(object):
             self._place_stamina_window()
         # 快照可能刚建立 —— 托盘里「恢复上次设置」的置灰状态要跟着刷
         self._refresh_tray()
-        # 位置真动过才闪「已重置」—— _tick 每秒刷状态栏,实际只亮 ~1 秒;
-        # 已经在默认位置再点 = 没重置,照旧提示「已在默认位置」。
-        # 2026-10-14 晚用户要求:原「已重置位置,可恢复」太长,缩短成「已重置」
-        # (和「恢复上次设置」闪「已恢复」是同一批改动)。
-        self.status_label.config(
-            text="已重置" if moved else "已在默认位置")
-        self.root.after(1500, self._update_status_label)
+        # 位置真动过才闪「已重置」;已经在默认位置 = 没重置,提示「已在默认位置」。
+        # 2026-10-14 晚用户要求:原「已重置位置,可恢复」太长,缩短成「已重置」。
+        # 2026-11-13:改走 _flash_status —— 老写法的提示会被 _tick 下一帧抹掉。
+        self._flash_status("已重置" if moved else "已在默认位置")
 
     def _prev_settings_path(self):
         """1 号快照(最新那份)的路径;托盘「恢复上次设置」的置灰就看它在不在。"""
@@ -3376,6 +3567,14 @@ class SimpleGameTimer(object):
         保存都可能产生这种重复槽,退它屏幕上看不出变化,像点了没反应。连点 =
         一层层往回退,撞到底提示「没有更早的设置」。退回后置 pending_snapshot:
         再动手改的第一次保存会先把"退回的状态"留成新快照,不会白退。
+
+        2026-11-13:restore_depth 只在内存里,**重启就归零**。以前重启后再点
+        「恢复」会从 1 号退起 —— 而 1 号往往正是"刚才退掉的那个较新状态",
+        于是点下去反而**往前跳**。现在层数连同文件指纹存在配置旁边的
+        `<名字>.restore`(见 `Config.set_restore_depth` / `_load_restore_state`),
+        重启后原样接上。⚠️ 别改回"拿当前内容和快照比对猜层数"—— 快照里重复
+        内容很多,猜出来的层数会错位(2026-11-13 用户实测:第二次恢复把第一次
+        的恢复撤了)。任何真保存都会清零(`Config.save`)。
         """
         path = self.cfg.path
         try:
@@ -3395,24 +3594,25 @@ class SimpleGameTimer(object):
             depth += 1              # 这层和现在的设置一模一样,退它没意义,继续往下
         src = _prev_slot_path(path, depth + 1)
         if not os.path.exists(src):
-            self.status_label.config(
-                text="没有更早的设置" if depth else "还没有可恢复的设置")
-            self.root.after(1500, self._update_status_label)
+            # ⚠️ 别再用「config(text=...) + after(...)」的老写法:_tick 下一帧
+            # 会调 _update_status_label 把它抹掉,提示等于看不见(2026-11-13 修,
+            # 和 2026-11-10 F8 提示语一闪就没是同一个坑)。
+            self._flash_status("没有更早的设置" if depth else "还没有可恢复的设置")
             return
         try:
             shutil.copyfile(src, path)
         except OSError:
-            self.status_label.config(text="恢复失败")
-            self.root.after(1500, self._update_status_label)
+            self._flash_status("恢复失败")
             return
         self.cfg.restore_depth = depth + 1
         self.cfg.pending_snapshot = True
         self._reload_from_disk()
         # 还原换掉了整份配置(编辑模式可能被 _reload_from_disk 进出过),托盘状态跟着刷
         self._refresh_tray()
+        # 层数连同**恢复后**的文件指纹落盘:重启后接着往回退,不用再猜
+        self.cfg.set_restore_depth(depth + 1)
         # 2026-10-14 晚用户要求:这句太长,就闪「已恢复」(原「已恢复上次设置」)
-        self.status_label.config(text="已恢复")
-        self.root.after(1500, self._update_status_label)
+        self._flash_status("已恢复")
 
     # ==================================================================
     # 改键捕获
@@ -3469,8 +3669,7 @@ class SimpleGameTimer(object):
                 self._hotkey_hint.set("已设为 {}{}".format(spec, warn))
             except tk.TclError:
                 pass
-        self.status_label.config(text="已设为 {}{}".format(spec, warn))
-        self.root.after(1500, self._update_status_label)
+        self._flash_status("已设为 {}{}".format(spec, warn))
 
     # ==================================================================
     def run(self):
