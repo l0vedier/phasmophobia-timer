@@ -332,6 +332,9 @@ DEFAULTS = {
         "font_size": "87",
         "timer2_font_size": "40",
         "status_font_size": "25",
+        # 2026-11-12:第二计时器要不要显示并可用。托盘「显示第二计时器」勾选,
+        # 0 = 隐藏 + 停用(标签不显示、窗口缩短、左键和 F2 都不再操作它)。
+        "timer2_visible": "1",
         "opacity": "0.85",
         "window_x": "10",
         "window_y": "10",
@@ -402,6 +405,7 @@ CONFIG_HEADER = """\
 ;
 ;   font_size                    主计时器字号(秒表**共用**这个值,没有单独的字号)
 ;   timer2_font_size             第二计时器字号
+;   timer2_visible               1 / 0 —— 显示并启用第二计时器(托盘菜单里那个勾)
 ;   status_font_size             状态文字字号
 ;   opacity                      窗口不透明度 0.0 - 1.0
 ;   window_x / window_y          窗口位置(编辑模式拖动后自动写回)
@@ -1223,6 +1227,9 @@ class SimpleGameTimer(object):
         self._timer2_dim_id = None   # 偷看 3 秒倒计时的 after id(见 _schedule_dim_timer2)
         self.last_min2 = -1
         self._phase_text = ""
+        # 2026-11-12 用户点名:不用第二计时器时,托盘一个勾把它隐藏 + 停用
+        # (标签不显示、窗口缩短、左键和 F2 都不再操作它)。存配置,重开还这样。
+        self._timer2_visible = bool(self.cfg.get_int("Display", "timer2_visible"))
 
         self.new_sec_running = False
         self.new_start_sec = 0.0
@@ -1338,6 +1345,10 @@ class SimpleGameTimer(object):
             self._exit_edit_mode(save=False)
 
         self.cfg.load()
+        # 手改 config.ini 里的 timer2_visible 也要立刻生效(和托盘勾等价)
+        self._timer2_visible = bool(self.cfg.get_int("Display", "timer2_visible"))
+        if not self._timer2_visible:
+            self._halt_timer2()
         self._load_timer_params()
         self.hotkeys = self._load_hotkeys()
         # 体力条的按键 / 显隐 / 位置也跟着配置走(手改 key_sprint 之类的立刻生效)
@@ -1479,31 +1490,43 @@ class SimpleGameTimer(object):
 
         # 第二计时器:接在主计时器的**下边缘**下面,左边缘与它对齐(都在 x=20)
         t2_y = main_y + t1_h + distance_below
-        self.time_label2.place(x=20, y=t2_y)
-        self.root.update_idletasks()
 
-        # 状态文字摆到第二计时器的右边。x 是定值,不随文字内容左右跳。
-        status_x = 20 + self.time_label2.winfo_reqwidth() + 12
+        if self._timer2_visible:
+            self.time_label2.place(x=20, y=t2_y)
+            self.root.update_idletasks()
 
-        # y 要让两者的**墨迹底边齐平**。
-        #
-        # ⚠️ 不能对**控件框** —— 两个控件字体不同、字号也不同,框对齐了墨迹照样歪。
-        # 只能对**基线**,基线在各自控件内的偏移 = bd + pady + ascent。
-        # 两边 bd 都是 1,抵消掉,只剩状态文字多出来的那个 pady。
-        #
-        # 但基线和**墨迹底边**之间还有一点差,而且两个字体差的方向**相反**(实测):
-        #     微软雅黑        汉字略微**探到基线下**   约 0.12  × 字号(25 号 3px、40 号 5px)
-        #     Digital-7 Mono  数码管数字**够不到基线**  约 0.025 × 字号(40 号 1px)
-        # 这两段之和(当前字号下 4px)就是还要再往下压的量。
-        # 它随字号**线性**变,所以按字号算 —— 滚轮调完字号之后,底边仍然是齐的。
-        st_size = self.cfg.get_int("Display", "status_font_size")
-        t2_size = self.cfg.get_int("Display", "timer2_font_size")
-        ascent_t2 = int(self.root.tk.call(
-            "font", "metrics", (FONT_FAMILY, t2_size, FONT_WEIGHT), "-ascent"))
-        ascent_st = int(self.root.tk.call(
-            "font", "metrics", (FONT_FAMILY_STATUS, st_size, FONT_WEIGHT), "-ascent"))
-        ink_drop = round(0.12 * st_size + 0.025 * t2_size)
-        status_y = t2_y + ascent_t2 - ascent_st - STATUS_PADY - ink_drop
+            # 状态文字摆到第二计时器的右边。x 是定值,不随文字内容左右跳。
+            status_x = 20 + self.time_label2.winfo_reqwidth() + 12
+
+            # y 要让两者的**墨迹底边齐平**。
+            #
+            # ⚠️ 不能对**控件框** —— 两个控件字体不同、字号也不同,框对齐了墨迹照样歪。
+            # 只能对**基线**,基线在各自控件内的偏移 = bd + pady + ascent。
+            # 两边 bd 都是 1,抵消掉,只剩状态文字多出来的那个 pady。
+            #
+            # 但基线和**墨迹底边**之间还有一点差,而且两个字体差的方向**相反**(实测):
+            #     微软雅黑        汉字略微**探到基线下**   约 0.12  × 字号(25 号 3px、40 号 5px)
+            #     Digital-7 Mono  数码管数字**够不到基线**  约 0.025 × 字号(40 号 1px)
+            # 这两段之和(当前字号下 4px)就是还要再往下压的量。
+            # 它随字号**线性**变,所以按字号算 —— 滚轮调完字号之后,底边仍然是齐的。
+            st_size = self.cfg.get_int("Display", "status_font_size")
+            t2_size = self.cfg.get_int("Display", "timer2_font_size")
+            ascent_t2 = int(self.root.tk.call(
+                "font", "metrics", (FONT_FAMILY, t2_size, FONT_WEIGHT), "-ascent"))
+            ascent_st = int(self.root.tk.call(
+                "font", "metrics", (FONT_FAMILY_STATUS, st_size, FONT_WEIGHT), "-ascent"))
+            ink_drop = round(0.12 * st_size + 0.025 * t2_size)
+            status_y = t2_y + ascent_t2 - ascent_st - STATUS_PADY - ink_drop
+        else:
+            # 2026-11-12 用户点名「都不使用第二计时器了就不显示与第二计时器相关的
+            # 状态文字了」:数字不显示,那一行只留给状态文字 —— 实际只剩主计时器
+            # 自己的「已暂停」;等待左键 / 进攻 / 平静 在停用状态下根本不会产生
+            # (见 handle_f2_key / handle_left_click_timer2 的守卫)。
+            # 高度按状态文字底边算,窗口跟着缩短。
+            self.time_label2.place_forget()
+            status_x = 20
+            status_y = t2_y
+
         self.status_label.place(x=status_x, y=status_y)
         self.root.update_idletasks()
 
@@ -1511,8 +1534,9 @@ class SimpleGameTimer(object):
                      40 + self.time_label.winfo_reqwidth() + self.sec_label.winfo_reqwidth(),
                      status_x + self._status_reserved_width() + 20)
         need_h = max(self.cfg.get_int("Display", "window_h"),
-                     t2_y + self.time_label2.winfo_reqheight() + 12,
                      status_y + self.status_label.winfo_reqheight() + 12)
+        if self._timer2_visible:
+            need_h = max(need_h, t2_y + self.time_label2.winfo_reqheight() + 12)
         self.root.geometry(_fmt_geometry(need_w, need_h, self._pos[0], self._pos[1]))
 
         if self.edit_mode:
@@ -2339,6 +2363,11 @@ class SimpleGameTimer(object):
         # 用户实测点名"不会影响第二计时器的计时"。
         # (初始状态 dimmed 是 False —— 一开始就常亮;靠 state2 卡"没在计时"的
         # 情况一律进等待,别只判 dimmed。)
+        #
+        # 2026-11-12:托盘把第二计时器关掉之后(隐藏 + 停用),F2 一律无效 ——
+        # 看不见的表不许被按出来。
+        if not self._timer2_visible:
+            return
         if self.timer2_dimmed and self.state2 == "counting_up":
             self.timer2_dimmed = False
             # 偷看时 armed 保持 False(表在走,左键本来也不该重开;
@@ -2410,6 +2439,10 @@ class SimpleGameTimer(object):
         #
         # 2026-10-15 起:等待左键是常亮的,armed 与 waiting 同步置位,
         # 左键只在「等待左键」时有效;空闲/计时中一律无效(守卫两道都要)。
+        #
+        # 2026-11-12:第二计时器被托盘关掉时,左键更不该把它启动起来。
+        if not self._timer2_visible:
+            return
         if not self.timer2_waiting or not self.timer2_armed:
             return
         # 起表 = **立刻虚化**(2026-10-15 用户定稿:「如果按左键开始计时了立刻
@@ -2612,6 +2645,14 @@ class SimpleGameTimer(object):
             pystray.MenuItem("编辑模式", lambda: self._tray_call(self._toggle_edit_mode),
                              checked=lambda item: self.edit_mode),
         ]
+        if self._has_timer:
+            # 2026-11-12 用户点名:不用第二计时器时,托盘一个勾把它隐藏 + 停用
+            # (窗口跟着缩短,左键 / F2 都不再操作它)。checked 和别的勾一样是
+            # **重建菜单时**求值,toggle 完必须 _refresh_tray 才会变。
+            items.append(
+                pystray.MenuItem("显示第二计时器",
+                                 lambda: self._tray_call(self.toggle_timer2),
+                                 checked=lambda item: self._timer2_visible))
         if self._has_timer and self._has_stamina:
             # 二合一的体力条浮窗开关。checked 和 enabled 一样,是**重建菜单时**
             # 求值,所以 _toggle_stamina 最后要调 _refresh_tray,否则勾不会变。
@@ -2655,6 +2696,48 @@ class SimpleGameTimer(object):
 
         self._tray = pystray.Icon("PhasmoTools", image, _app_title(), menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 第二计时器开关(2026-11-12 用户点名)
+    # ------------------------------------------------------------------
+    def _halt_timer2(self):
+        """把第二计时器停干净:归零、退出等待 / 虚化、撤掉偷看倒计时。
+
+        只被「隐藏 + 停用」那条路调用(托盘勾 / 手改配置)。看不见的表不该在
+        后台继续跑,再打开时应该是干净的 00:00 常亮。
+        """
+        try:
+            self._cancel_dim_timer2()
+            self.state2 = "stopped"
+            self.timer2_waiting = False
+            self.timer2_armed = False
+            self.timer2_dimmed = False
+            self.last_min2 = -1
+            self._phase_text = ""
+            self.time_label2.config(text="00:00")
+        except Exception:
+            pass
+
+    def toggle_timer2(self):
+        """托盘「显示第二计时器」:取消勾 = 隐藏 + 停用。
+
+        关掉时顺手归零、退出等待/虚化 —— 看不见的表不该在后台跑,再打开时是
+        干净的 00:00 常亮。状态文字里跟第二计时器有关的那几个词(等待左键 /
+        进攻 / 平静)在停用状态下根本产生不了,见 handle_f2_key /
+        handle_left_click_timer2 的守卫。
+        """
+        if not self._has_timer:
+            return
+        on = not self._timer2_visible
+        self._timer2_visible = on
+        if not on:
+            self._halt_timer2()
+        self.cfg.set("Display", "timer2_visible", 1 if on else 0)
+        self.cfg.save()
+        self._relayout()
+        self._apply_sec2_color()
+        self._update_status_label()
+        self._refresh_tray()
 
     # ------------------------------------------------------------------
     # 触摸板 / 触摸屏开关(2026-11-09 用户点名)
