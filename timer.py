@@ -550,6 +550,41 @@ def _fmt_geometry(w, h, x, y):
     return "{}x{}+{}+{}".format(w, h, x, y)
 
 
+def _no_taskbar(win):
+    """2026-11-15 用户点名:工具**不要在任务栏占一格**,只留托盘图标 + F6。
+
+    用户原话「不希望恐鬼症工具或者计时器有弹窗……只保留快捷关闭以及系统托盘即可」
+    —— 截图指的是任务栏上那个「恐鬼症工具」按钮,不是真的对话框。
+
+    做法:给窗口加扩展样式 `WS_EX_TOOLWINDOW` —— 任务栏按钮、Alt+Tab 条目都没了,
+    窗口本身、置顶、透明色、位置一概不动。
+    ⚠️ **别改用 `win.attributes("-toolwindow", True)`**:Tk 在 overrideredirect
+    窗口上会**重建 HWND**(实测 hwnd 从 1181364 变成 1836964),透明色 / 置顶 /
+    几何都得重新摆一遍,容易再踩一次"窗口发糊 / 点不穿"的老坑。
+    """
+    try:
+        win.update_idletasks()
+        u = ctypes.windll.user32
+        u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_ssize_t]
+        hwnd = u.GetParent(win.winfo_id()) or win.winfo_id()
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        ex = u.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        if ex & WS_EX_TOOLWINDOW:
+            return
+        u.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW)
+        # 改完样式要让 Shell 重新算一次任务栏条目,否则按钮会挂到下次刷新才消失
+        SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x0001, 0x0002, 0x0004, 0x0020
+        u.SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                       SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
 def _chip_font(text):
     """键帽用哪个字体:纯 ASCII 用等宽,出现中文就换雅黑。
 
@@ -1535,6 +1570,8 @@ class SimpleGameTimer(object):
         except Exception:
             pass
 
+        # 不占任务栏(用户 2026-11-15 点名),只留托盘图标 + F6。见 _no_taskbar。
+        _no_taskbar(self.root)
         # 主计时器
         self.time_label = tk.Label(
             self.root, text="00:00", font=(FONT_FAMILY, 87, FONT_WEIGHT),
@@ -1689,6 +1726,9 @@ class SimpleGameTimer(object):
         # 背景色即透明色 —— 整个背景点击穿透,不影响游戏操作
         if not self.edit_mode:
             self.root.attributes("-transparentcolor", self.bg_color)
+        # ⚠️ 设 -alpha / -transparentcolor 会把扩展样式**重建**(TOOLWINDOW 位丢),
+        # 任务栏按钮就又回来了 —— 每次改完透明度/透明色都得补一次。
+        _no_taskbar(self.root)
 
         self.time_label.config(font=(fam, self.cfg.get_int("Display", "font_size"), FONT_WEIGHT),
                                bg=self.bg_color, fg=self._main_color())
@@ -1944,6 +1984,7 @@ class SimpleGameTimer(object):
         # 才能走到 _tray.stop() -> os._exit(0) 的干净退出路径。
         win.protocol("WM_DELETE_WINDOW", self.close_program)
         win.withdraw()
+        _no_taskbar(win)        # 体力条也不占任务栏(2026-11-15 用户点名)
         self._stam_win = win
         self._stam_cv = cv
         self._stam_move = self._stam_sprint = self._stam_crouch = False
@@ -2054,6 +2095,8 @@ class SimpleGameTimer(object):
                 TRANSPARENT_DISABLED if self.edit_mode else COLOR_BG)
         except tk.TclError:
             pass
+        # 同上:改完 -alpha / -transparentcolor,扩展样式会丢,任务栏按钮会回来
+        _no_taskbar(self._stam_win)
         # 底部那行字在编辑模式下要换成「拖动移动 · 滚轮缩放」,所以得重画
         self._draw_stamina()
 
@@ -2661,6 +2704,7 @@ class SimpleGameTimer(object):
         if self._has_timer:
             # 关掉透明色,让整个窗口变成实心可点区域
             self.root.attributes("-transparentcolor", TRANSPARENT_DISABLED)
+            _no_taskbar(self.root)      # 改透明色会重置扩展样式,补回来
             self.edit_border.place(x=0, y=0,
                                    width=self.root.winfo_width(),
                                    height=self.root.winfo_height())
@@ -2683,6 +2727,7 @@ class SimpleGameTimer(object):
             self.edit_border.place_forget()
             self.edit_hint.place_forget()
             self.root.attributes("-transparentcolor", self.bg_color)
+            _no_taskbar(self.root)      # 同上,补一次
         self._bind_stam_drag(False)
         self._apply_stamina_style()
 
@@ -3032,6 +3077,7 @@ class SimpleGameTimer(object):
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.configure(bg=HK_BORDER)
+        _no_taskbar(win)        # 设置窗口也别占任务栏(2026-11-15 用户点名)
 
         body = tk.Frame(win, bg=HK_BG)
         body.pack(fill="both", expand=True, padx=1, pady=1)
