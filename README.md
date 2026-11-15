@@ -1,23 +1,24 @@
 # 恐鬼症工具 · Phasmophobia Tools
 
-给《恐鬼症》（Phasmophobia）用的桌面置顶浮窗：无边框、半透明、浮在游戏画面上，全局热键在游戏里直接按，不用切窗口。同一个代码库出三个成品，按需下载：
+给《恐鬼症》（Phasmophobia）用的桌面置顶浮窗：无边框、半透明、浮在游戏画面上，全局热键在游戏里直接按，不用切窗口。同一个代码库出两个成品，按需下载：
 
 | 成品 | 可执行文件 | 内容 | 配置文件 |
 |---|---|---|---|
 | **恐鬼症工具**（二合一） | `tools.exe` | 计时器 + 体力条 | `config.ini` |
 | **恐鬼症工具-计时器** | `timer.exe` | 只有计时器 | `timer.ini` |
-| **恐鬼症工具-体力条** | `stamina.exe` | 只有体力条 | `stamina.ini` |
 
-三套设置各自独立，**三个工具可以同时开、互不干扰**。下载在 Releases：每个成品一个 Release，按需取。
+两套设置各自独立，**两个工具可以同时开、互不干扰**。
 
-**Phasmophobia Tools** is a frameless, always-on-top overlay for *Phasmophobia* on Windows. It ships as three builds: a combined round timer + stamina bar, a timer-only build, and a stamina-bar-only build. Everything is driven by global hotkeys so nothing interrupts the game. Settings live in `%APPDATA%` and survive updates. Built with Python, tkinter and pynput.
+> 2026-11-15 起**不再单独出「体力条」版本** —— 体力条只作为二合一里的一部分。下载在 Releases：每个成品一个 Release，按需取。
+
+**Phasmophobia Tools** is a frameless, always-on-top overlay for *Phasmophobia* on Windows. It ships as two builds: a combined round timer + stamina bar, and a timer-only build. Everything is driven by global hotkeys so nothing interrupts the game. Settings live in `%APPDATA%` and survive updates. Built with Python, tkinter and pynput.
 
 > 关键词 / Keywords：恐鬼症、恐鬼症计时器、恐鬼症体力条、恐鬼症猎杀计时、Phasmophobia、phasmophobia timer、stamina bar、hunt timer、speedrun timer、游戏计时器、桌面置顶计时器、Windows overlay、Python tkinter
 
 ## 功能
 
 - **三个独立计时单元**：主计时器（一局的主计时）、第二计时器（事件计时，顺带算出「进攻 / 平静」；用不到可在托盘一键隐藏 + 停用）、独立秒表
-- **体力条**：贴在屏幕左下角，读键盘真实按键算剩余体力（三段式圆角块，大小 / 长度可调）
+- **体力条**：包在计时器外侧的三段弧，读键盘真实按键算剩余体力（每段 = 1 秒冲刺；三格蓝、两格黄、一格红）
 - **触摸板开关**：`F8` 或托盘一键**停用触摸板/触摸屏设备**（鼠标照常，跟插没插鼠标无关），退出程序自动启用回来；要管理员权限，启动时弹一次 UAC
 - **全程全局热键**：`F1` `F2` `T` `R` `F3` `F6` `F8`、鼠标左右键、空格，游戏全屏里也能响应
 - **无边框置顶浮窗**：没有标题栏和关闭按钮，故意不碍事；可虚化，虚化期间误按不影响计时
@@ -52,7 +53,6 @@
 pip install -r requirements.txt
 python entry_tools.py      :: 二合一
 python entry_timer.py      :: 只有计时器
-python entry_stamina.py    :: 只有体力条
 ```
 
 程序靠全局热键工作，需要**以管理员身份运行**（首次启动会自己请求提权）。
@@ -61,7 +61,6 @@ python entry_stamina.py    :: 只有体力条
 
 ```bat
 pyinstaller timer.spec     :: → dist\timer\timer.exe
-pyinstaller stamina.spec   :: → dist\stamina\stamina.exe
 pyinstaller tools.spec     :: → dist\tools\tools.exe
 ```
 
@@ -69,7 +68,7 @@ pyinstaller tools.spec     :: → dist\tools\tools.exe
 
 ## 配置
 
-配置存在 `%APPDATA%\PhasmophobiaTimer\`（三个成品各一个 ini，见上表），**不在程序文件夹**——这样更新程序不会把设置一起换掉。托盘菜单里的「设置…」可以直接改透明度、字号、上限、体力条大小和所有热键，改完自动保存、即刻生效。想彻底恢复默认，删掉对应的 ini，下次启动自动重建。
+配置存在 `%APPDATA%\PhasmophobiaTimer\`（两个成品各一个 ini，见上表），**不在程序文件夹**——这样更新程序不会把设置一起换掉。托盘菜单里的「设置…」可以直接改透明度、字号、上限、体力条大小和所有热键，改完自动保存、即刻生效。想彻底恢复默认，删掉对应的 ini，下次启动自动重建。
 
 ## 许可
 

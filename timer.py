@@ -12,6 +12,7 @@
 """
 
 import configparser
+import math
 import ctypes
 import os
 import re
@@ -290,6 +291,21 @@ STAM_W = 220
 STAM_H = 66
 STAM_MARGIN = 20          # 自动摆到左下角时离屏幕边多远
 STAM_TICK_MS = 33         # ≈30 Hz;体力是按真实 dt 积分的,掉帧也不会漂
+
+# 体力条的「包边三段弧」(2026-11-15 用户定稿):
+# 从主计时器右侧 → 绕过右下角 → 到第二计时器左下侧,一条平滑曲线,
+# 按长度切成三段(每段 = 1 秒冲刺)。
+STAM_ARC_INSET = 0        # 起点相对主计时器数字右上角的水平偏移
+STAM_ARC_OUT_X = 44       # 竖直线相对主计时器右边缘**向右**平移多少
+STAM_ARC_OUT_Y = 44       # 水平线相对第二计时器下边缘**向下**平移多少
+STAM_ARC_BULGE = 90       # 曲线外凸量(用户选的那档)
+STAM_ARC_GAP = 10         # 段与段之间的缺口
+STAM_ARC_WIDTH = 6        # 线宽
+STAM_ARC_TRACK = "#3A3A3A"
+# 2026-11-15 用户定:**三格蓝、两格黄、一格及以下红;力竭一律红**
+STAM_ARC_BLUE = "#4DA3FF"      # 还剩 3 格
+STAM_ARC_YELLOW = "#FFD24D"    # 还剩 2 格
+STAM_ARC_RED = "#FF5C4D"       # 还剩 1 格或更少 / 力竭
 
 
 def _vks_of(name):
@@ -1605,6 +1621,23 @@ class SimpleGameTimer(object):
             self.root, text="00:00", font=(FONT_FAMILY, 40, FONT_WEIGHT),
             fg="#4ECDC4", bg="#1A1A1A", bd=1, relief="flat", padx=10, pady=0)
 
+        # 体力条的「包边弧」画在**独立浮窗**上(2026-11-15)。
+        # 为什么不用主窗口里的 Canvas:主窗口的标签有实底(#1A1A1A),Tk 会先用
+        # 标签底色把 Canvas 盖掉,弧穿过标签框的地方直接消失(实测左下那段被吃掉)。
+        # 单独一个置顶透明窗盖在计时器上面,就没有遮挡问题。
+        self.arc_win = tk.Toplevel(self.root)
+        self.arc_win.overrideredirect(True)
+        self.arc_win.attributes("-topmost", True)
+        self.arc_win.configure(bg=COLOR_BG)
+        self.arc_cv = tk.Canvas(self.arc_win, bg=COLOR_BG, highlightthickness=0, bd=0)
+        self.arc_cv.pack(fill="both", expand=True)
+        # 弧窗是"没有标题栏的置顶窗",但它可能变成进程的 MainWindowHandle ——
+        # 重启脚本按 WM_CLOSE 关程序时会打到它身上,不接这条就关不掉(2026-11-15 实测)。
+        self.arc_win.protocol("WM_DELETE_WINDOW", self.close_program)
+        self.arc_win.withdraw()
+        _no_taskbar(self.arc_win)
+        self._arc_geom = None          # (A, B, 点集),由 _relayout 算好存着
+
         # 编辑模式用的边框和提示(默认不显示)
         self.edit_border = tk.Frame(self.root, bg="#1A1A1A",
                                     highlightthickness=3, highlightbackground="#4ECDC4")
@@ -1619,9 +1652,13 @@ class SimpleGameTimer(object):
     # 短的会贴在左边,和「等待左键」不在一个视觉位置上。
     # 全角空格实测正好 33px = 一个汉字的宽度(和「等」等宽),垫上去它们就
     # 落在「待左」那两个字底下了。普通半角空格只有 10px,对不齐。
-    PHASE_ATTACK = "　进攻"
-    PHASE_CALM = "　平静"
-    STATUS_TEXTS = ("", "已 暂 停", "等待左键", PHASE_ATTACK, PHASE_CALM)
+    # 2026-11-15:状态文字改成右对齐后,前面那个全角空格没用了(它本来是为了
+    # 让两个字和四个字左对齐),去掉省得右边被挤。
+    PHASE_ATTACK = "进攻"
+    PHASE_CALM = "平静"
+    # 2026-11-15 用户要求:超过两个字的提示词全部删除。
+    # 删掉的两个是「已 暂 停」和「等待左键」;暂停 / 等待期间状态栏现在不写字。
+    STATUS_TEXTS = ("", "等待", PHASE_ATTACK, PHASE_CALM)
 
     def _status_reserved_width(self):
         """状态栏按最宽内容预留的宽度。用临时控件实测,不同字体族才准。"""
@@ -1634,6 +1671,138 @@ class SimpleGameTimer(object):
             widest = max(widest, probe.winfo_reqwidth())
         probe.destroy()
         return widest
+
+    # ------------------------------------------------------------------
+    # 体力包边弧(2026-11-15 用户定稿的形态)
+    # ------------------------------------------------------------------
+    def _stam_arc_points(self, ax, ay, bx, by, n=220):
+        """A→B 的路径(2026-11-15 用户定稿)。
+
+          ① 主计时器**右下角向右**延出一段 → P1(A 竖直落下来到 P1)
+          ② 第二计时器**右下角向下**延出一段 → P2(水平线从 P2 伸到 B)
+          ③ P1 → P2 用一段弧连起来
+
+        所以整条是「竖直线 + 弧 + 水平线」,竖直和水平的长度由两个延出量决定。
+        """
+        p1x, p1y = self._arc_p1          # = (主计时器右下角右移后, 主计时器下边缘)
+        p2x, p2y = self._arc_p2          # = (第二计时器右边缘, 第二计时器右下角下移后)
+        pts = []
+        # ① 竖直线:A → P1(同一个 x)
+        seg1 = max(2, int(n * 0.30))
+        for i in range(seg1):
+            t = i / float(seg1)
+            pts.append((ax + (p1x - ax) * t, ay + (p1y - ay) * t))
+        # ② 弧 P1 → P2:控制点取右下直角点,切线在两端分别是竖直/水平 → 无折角
+        ctrl = (p1x, p2y)
+        seg2 = max(2, int(n * 0.40))
+        for i in range(seg2):
+            t = i / float(seg2 - 1)
+            u = 1.0 - t
+            pts.append((u * u * p1x + 2 * u * t * ctrl[0] + t * t * p2x,
+                        u * u * p1y + 2 * u * t * ctrl[1] + t * t * p2y))
+        # ③ 水平线:P2 → B(同一个 y)
+        seg3 = max(2, int(n * 0.30))
+        for i in range(1, seg3):
+            t = i / float(seg3)
+            pts.append((p2x + (bx - p2x) * t, p2y + (by - p2y) * t))
+        pts.append((bx, by))
+        # 圆头端帽会从端点外鼓 线宽/2 —— 沿路径两端各切掉这么多,
+        # 保证「看得见的边」正好落在锚点上,同时竖线/横线仍然是严格垂直/水平的。
+        trim = STAM_ARC_WIDTH / 2.0
+        lens = [0.0]
+        for i in range(1, len(pts)):
+            lens.append(lens[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                              pts[i][1] - pts[i - 1][1]))
+        total = lens[-1]
+        pts = [p for p, L in zip(pts, lens) if trim <= L <= total - trim]
+        # ⚠️ 重采样成**等距点**:上面三段是分别按 30%/40%/30% 的点数生成的,
+        # 点密的地方每点代表的长度短 —— 直接按索引/累计长度切三等分会切不匀
+        # (实测三段 153.4 / 144.6 / 149.8)。用户要求「只看长度分」,
+        # 所以先按弧长等距重采样,再等分,三段就真的一样长。
+        lens = [0.0]
+        for i in range(1, len(pts)):
+            lens.append(lens[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                              pts[i][1] - pts[i - 1][1]))
+        total = lens[-1]
+        n_out = 400
+        out = []
+        j = 0
+        for i in range(n_out):
+            target = total * i / (n_out - 1.0)
+            while j < len(lens) - 2 and lens[j + 1] < target:
+                j += 1
+            if lens[j + 1] - lens[j] <= 1e-9:
+                out.append(pts[j])
+                continue
+            t = (target - lens[j]) / (lens[j + 1] - lens[j])
+            out.append((pts[j][0] + (pts[j + 1][0] - pts[j][0]) * t,
+                        pts[j][1] + (pts[j + 1][1] - pts[j][1]) * t))
+        return out
+
+    def _stam_arc_thirds(self, pts):
+        """按**弧长**把整条路径切成三段等长的弧(段间留 STAM_ARC_GAP)。
+
+        2026-11-15:以前是从每段的起止各切半个缺口 —— 这样首尾两段各少 5px、
+        中间那段少 10px,三段就不等长了(实测 152.9 / 146.9 / 152.9)。
+        现在先算好"每段该多长",再按固定步长排布:
+            段长 = (总长 - 2×缺口) / 3
+            第 k 段 = [k×(段长+缺口) + 0, k×(段长+缺口) + 段长]
+        这样三段严格等长,缺口也均匀。
+        """
+        lens = [0.0]
+        for i in range(1, len(pts)):
+            lens.append(lens[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                              pts[i][1] - pts[i - 1][1]))
+        total = lens[-1]
+        seg_len = max(1.0, (total - 2 * STAM_ARC_GAP) / 3.0)
+        out = []
+        for k in range(3):
+            l0 = k * (seg_len + STAM_ARC_GAP)
+            l1 = l0 + seg_len
+            out.append([pts[i] for i, L in enumerate(lens) if l0 <= L <= l1])
+        return out
+
+    def _draw_stam_arc(self):
+        cv = getattr(self, "arc_cv", None)
+        geom = getattr(self, "_arc_geom", None)
+        if cv is None:
+            return
+        try:
+            if not cv.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        cv.delete("all")
+        if geom is None:
+            return
+        m = self.stam_model
+        frac = (m.stam / m.cap) if m.cap > 0 else 0.0
+        # 颜色按"还剩几格"算:3 格蓝、2 格黄、1 格及以下红;力竭(跑空)一律红。
+        # 用 1e-6 的容差,免得正好 2/3 时被浮点误差判成黄。
+        if m.winded or frac <= 1.0 / 3.0 + 1e-6:
+            col = STAM_ARC_RED
+        elif frac <= 2.0 / 3.0 + 1e-6:
+            col = STAM_ARC_YELLOW
+        else:
+            col = STAM_ARC_BLUE
+        for k, seg in enumerate(self._stam_arc_thirds(geom[4])):
+            if len(seg) < 2:
+                continue
+            flat = [c for p in seg for c in (round(p[0]), round(p[1]))]
+            cv.create_line(*flat, fill=STAM_ARC_TRACK, width=STAM_ARC_WIDTH,
+                           capstyle="round", joinstyle="round")
+            # 2026-11-15 用户要求:「体力从右上角到左下角」——也就是消耗从右上开始,
+            # 剩下的部分留在左下。所以按"离左下端还有多远"算每一段亮多少:
+            # 左下那段(k=2)最先亮,右上那段(k=0)最后亮。
+            part = max(0.0, min(1.0, frac * 3.0 - (2 - k)))
+            if part > 0.01:
+                # ⚠️ 亮的是这一段的**末端**(靠左下那侧),不是起点 ——
+                # 这样整条弧看起来是"从右上往左下"连续变短的一条,
+                # 而不是每段各自由右上往左下填(用户 2026-11-15 纠正过)。
+                n = max(2, int(round(len(seg) * part)))
+                flat2 = [c for p in seg[-n:] for c in (round(p[0]), round(p[1]))]
+                cv.create_line(*flat2, fill=col, width=STAM_ARC_WIDTH,
+                               capstyle="round", joinstyle="round")
 
     def _relayout(self):
         """按当前字号重新摆放控件,并保证窗口足够大。"""
@@ -1662,7 +1831,18 @@ class SimpleGameTimer(object):
             self.root.update_idletasks()
 
             # 状态文字摆到第二计时器的右边。x 是定值,不随文字内容左右跳。
-            status_x = 20 + self.time_label2.winfo_reqwidth() + 12
+            # 2026-11-15:状态文字的**中心**要跟主计时器**右边那两个 0 的中心**对齐。
+            # 主数字墨迹右缘 = 20 + reqw - 11;再往左退半个「00」的宽度就是它的中心。
+            # 「00」的宽度直接用 Tk 量字体,不靠猜比例。
+            main_ink_right = 20 + self.time_label.winfo_reqwidth() - 11
+            try:
+                w00 = int(self.root.tk.call(
+                    "font", "measure",
+                    (FONT_FAMILY, self.cfg.get_int("Display", "font_size"), FONT_WEIGHT),
+                    "00"))
+            except tk.TclError:
+                w00 = 0
+            status_x = main_ink_right - w00 / 2.0
 
             # y 要让两者的**墨迹底边齐平**。
             #
@@ -1693,21 +1873,102 @@ class SimpleGameTimer(object):
             status_x = 20
             status_y = t2_y
 
-        self.status_label.place(x=status_x, y=status_y)
+        # anchor="n":水平只用中心一个锚点,文字两个字还是空都不会左右跳
+        self.status_label.place(x=status_x, y=status_y, anchor="n")
         self.root.update_idletasks()
 
         need_w = max(self.cfg.get_int("Display", "window_w"),
                      40 + self.time_label.winfo_reqwidth() + self.sec_label.winfo_reqwidth(),
-                     status_x + self._status_reserved_width() + 20)
+                     status_x + 20)
+
         need_h = max(self.cfg.get_int("Display", "window_h"),
                      status_y + self.status_label.winfo_reqheight() + 12)
         if self._timer2_visible:
             need_h = max(need_h, t2_y + self.time_label2.winfo_reqheight() + 12)
+
+        # ---- 体力包边弧(2026-11-15) ----
+        # 锚点:A = 主计时器右上角往右 STAM_ARC_INSET;
+        #       B = 第二计时器左下角往下 STAM_ARC_INSET。
+        # 两点用一条二次贝塞尔连起来(控制点在右下角再往外推 BULGE),按弧长切三段。
+        # ⚠️ 必须放在 need_w / need_h 都算完之后 —— 它要靠这两个值把窗口撑大。
+        arc_on = self._has_timer and bool(self.cfg.get_int("Stamina", "enabled"))
+        if arc_on:
+            # 2026-11-15 用户要求「体力条最上边跟最下边要跟计时器对齐」:
+            # A 的 y = 主计时器上边缘,B 的 y = 第二计时器下边缘,竖直方向不再多留
+            # 那 30px;水平方向 A 仍然离数字右边一段距离(不然线会压在字上)。
+            # 2026-11-15:数字的**墨迹**比 Label 的框小一圈(数码管字体行框留白很大)。
+            # 直接把框当作端点会明显偏上/偏下,所以按实测的墨迹内缩量校正:
+            #   主计时器:墨迹顶比框顶低 ~0.05 行高
+            #   第二计时器:墨迹底比框底高 ~0.20 行高,左缘比框左宽 ~11px(bd+padx)
+            ls1 = int(self.root.tk.call("font", "metrics",
+                                        (FONT_FAMILY, self.cfg.get_int("Display", "font_size"),
+                                         FONT_WEIGHT), "-linespace"))
+            ls2 = int(self.root.tk.call("font", "metrics",
+                                        (FONT_FAMILY, self.cfg.get_int("Display", "timer2_font_size"),
+                                         FONT_WEIGHT), "-linespace"))
+            # 数码管字体的墨迹比 Label 框小一圈:竖直方向实测 ≈ 0.19×行高,
+            # 水平方向 = bd+padx = 11。用这两个值把端点钉在**数字的角**上,
+            # 而不是窗口/标签框的角(用户 2026-11-15 明确要求)。
+            # 还要再往里收「线宽/2」:线是圆头的,墨迹会从中心线往外鼓半个线宽,
+            # 用户要求「不能超出一点」,所以按看得见的边来对齐。
+            half = STAM_ARC_WIDTH / 2.0
+            # ⚠️ 不要再往 x/y 里加 half —— 那会把竖线、横线各拧歪 3px
+            # (用户 2026-11-15 一眼看出来「直线都不垂直或者水平」)。
+            # 端点校正改成在 _stam_arc_points 末尾**沿路径**两端各切掉 线宽/2。
+            ax = 20 + self.time_label.winfo_reqwidth() - 11 + STAM_ARC_INSET + STAM_ARC_OUT_X
+            # ax 同时就是「主计时器右下角」的 x —— 竖直线严格贴右边缘,
+            # 到主计时器下边缘就结束,不会再往下伸(用户 2026-11-15 要求)
+            ay = main_y + int(round(0.19 * ls1))
+            bx = 20 + 11
+            by = (t2_y + self.time_label2.winfo_reqheight()
+                  - int(round(0.19 * ls2)) + STAM_ARC_OUT_Y)
+            # P1 = 主计时器右下角 **向右** 延出;P2 = 第二计时器右下角 **向下** 延出
+            main_right = 20 + self.time_label.winfo_reqwidth() - 11
+            main_bottom = (main_y + self.time_label.winfo_reqheight()
+                           - int(round(0.19 * ls1)))
+            sub_right = 20 + self.time_label2.winfo_reqwidth() - 11
+            sub_bottom = (t2_y + self.time_label2.winfo_reqheight()
+                          - int(round(0.19 * ls2)))
+            self._arc_p1 = (main_right + STAM_ARC_OUT_X, main_bottom)
+            self._arc_p2 = (sub_right, sub_bottom + STAM_ARC_OUT_Y)
+            pts = self._stam_arc_points(ax, ay, bx, by)
+            need_w = max(need_w, int(max(x for x, _y in pts)) + 10)
+            need_h = max(need_h, int(max(y for _x, y in pts)) + 10)
+            self._arc_geom = (ax, ay, bx, by, pts)
+        else:
+            self._arc_geom = None
         self.root.geometry(_fmt_geometry(need_w, need_h, self._pos[0], self._pos[1]))
 
         if self.edit_mode:
             self.edit_hint.place(relx=0.5, y=need_h - 26, anchor="n")
             self.edit_border.place(x=0, y=0, width=need_w, height=need_h)
+
+        # 设 -alpha / -transparentcolor 会把扩展样式重建(TOOLWINDOW 位丢),
+        # 每次 relayout 之后统一补一次,保证两个窗口都不占任务栏。
+        _no_taskbar(self.root)
+        if getattr(self, "arc_win", None) is not None:
+            _no_taskbar(self.arc_win)
+
+        # 弧窗和计时器窗同尺寸同位置,盖在它上面
+        if arc_on:
+            try:
+                self.arc_cv.config(width=need_w, height=need_h)
+                self.arc_win.attributes(
+                    "-alpha", max(0.1, min(1.0, self.cfg.get_float("Display", "opacity"))))
+                self.arc_win.attributes("-transparentcolor", COLOR_BG)
+                self.arc_win.geometry(_fmt_geometry(need_w, need_h,
+                                                    self._pos[0], self._pos[1]))
+                if not self.arc_win.winfo_ismapped() and self.root.winfo_ismapped():
+                    self.arc_win.deiconify()
+                self.arc_win.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self._draw_stam_arc()
+        else:
+            try:
+                self.arc_win.withdraw()
+            except tk.TclError:
+                pass
 
         # ⚠️ 主显示区(主计时器 / 秒表)必须**最后**摆,而且只能在这里摆。
         #
@@ -1941,13 +2202,10 @@ class SimpleGameTimer(object):
             return
         if self._capturing:
             self.status_label.config(text="请按键…")
-        elif self.state == "paused" and not self.force_hide_pause_text:
-            self.status_label.config(text="已 暂 停")
+        # 2026-11-15:「已 暂 停」按用户要求删除(暂停时状态栏空白);
+        # 「等待左键」缩短成「等待」保留 —— 超过两个字的提示词都不要。
         elif self.timer2_waiting:
-            # 2026-10-15 起「等待左键」是常亮的:waiting 与 armed 同步,文字
-            # 跟着整个等待状态走,点左键起表(或别的转换)才消失。armed 条件
-            # 留着当双保险,与左键守卫同款(见 handle_left_click_timer2)。
-            self.status_label.config(text="等待左键" if self.timer2_armed else "")
+            self.status_label.config(text="等待" if self.timer2_armed else "")
         elif self.state2 == "counting_up":
             self.status_label.config(text=self._phase_text)
         else:
@@ -2112,17 +2370,36 @@ class SimpleGameTimer(object):
             return
         if not self.stam_enabled:
             self._stop_stamina()
+            # 2026-11-15:二合一的体力画在**独立的弧窗**上,托盘取消勾选时
+            # 光停浮窗没用,弧还在 —— 这里也要把它收掉(用户报「隐藏按钮失效」)。
+            self._hide_arc()
             return
-        # 先按配置把尺寸/位置/画面整一遍,再套样式(样式里也会重画一次,
-        # 因为编辑模式的底部提示文字要跟着换)
-        self._apply_stam_scale()
-        self._apply_stamina_style()
-        self._stam_win.deiconify()
-        self._stam_win.attributes("-topmost", True)
+        if self._has_timer:
+            # 2026-11-15:二合一里体力画在计时器窗口的包边弧上,浮窗不再显示
+            self._stam_win.withdraw()
+        else:
+            # 独立体力条工具没有计时器,仍然用浮窗
+            self._apply_stam_scale()
+            self._apply_stamina_style()
+            self._stam_win.deiconify()
+            self._stam_win.attributes("-topmost", True)
         if self._stam_id is None:
             self._stam_t = time.perf_counter()
             self._draw_stamina()
             self._stam_id = self.root.after(STAM_TICK_MS, self._stam_tick)
+        if self._has_timer:
+            # 重新摆一次,顺带把弧窗显出来(取消勾选再勾上要能回来)
+            self._relayout()
+
+    def _hide_arc(self):
+        """把包边弧的浮窗收起来(体力条被关掉时用)。"""
+        win = getattr(self, "arc_win", None)
+        if win is None:
+            return
+        try:
+            win.withdraw()
+        except tk.TclError:
+            pass
 
     def _start_stamina(self):
         self._sync_stamina()
@@ -2168,7 +2445,10 @@ class SimpleGameTimer(object):
         if dt > 0.10:
             dt = 0.10
         self._stam_step(dt)
-        self._draw_stamina()
+        if self._has_timer and self._arc_geom is not None:
+            self._draw_stam_arc()       # 有计时器 → 画包边弧
+        else:
+            self._draw_stamina()        # 独立体力条工具 → 还是那个浮窗
         self._stam_id = self.root.after(STAM_TICK_MS, self._stam_tick)
 
     def _stam_step(self, dt):
