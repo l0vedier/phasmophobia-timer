@@ -620,6 +620,11 @@ def _ensure_admin():
 
 MUTEX_NAME = MODE_MUTEX["both"]        # 兼容旧引用;实际按 _app_mode() 取
 
+# 重复启动时弹的话。2026-11-15 用户点名「只留'已经在运行了'」——
+# 原来那段还写着「要重启到新版,请运行:E:\Claude code\restart_timer.ps1」,
+# 那是**本机开发用的路径**,发给别人只会让人一头雾水。别再加回去。
+SINGLE_INSTANCE_MSG = "已经在运行了"
+
 
 def _single_instance_guard():
     """同一时间只允许**同一个工具**开一个实例,防止多开。
@@ -3733,10 +3738,7 @@ def main(mode=None):
     if inst is False:
         try:
             ctypes.windll.user32.MessageBoxW(
-                None,
-                "{} 已经在运行了。\n\n这次不会再开第二个,免得留下重复的托盘图标。\n"
-                "要重启到新版,请运行:\nE:\\Claude code\\restart_timer.ps1(需管理员)".format(_app_title()),
-                _app_title(), 0x00000040)
+                None, SINGLE_INSTANCE_MSG, _app_title(), 0x00000040)
         except Exception:
             pass
         sys.exit(0)
