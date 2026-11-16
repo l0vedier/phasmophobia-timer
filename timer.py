@@ -296,10 +296,11 @@ STAM_TICK_MS = 33         # ≈30 Hz;体力是按真实 dt 积分的,掉帧也�
 # 从主计时器右侧 → 绕过右下角 → 到第二计时器左下侧,一条平滑曲线,
 # 按长度切成三段(每段 = 1 秒冲刺)。
 STAM_ARC_INSET = 0        # 起点相对主计时器数字右上角的水平偏移
-STAM_ARC_OUT_X = 44       # 竖直线相对主计时器右边缘**向右**平移多少
-STAM_ARC_OUT_Y = 44       # 水平线相对第二计时器下边缘**向下**平移多少
+STAM_ARC_OUT_X = 24       # 竖直线相对主计时器右边缘**向右**平移多少
+STAM_ARC_OUT_Y = 24       # 水平线相对第二计时器下边缘**向下**平移多少
 STAM_ARC_BULGE = 90       # 曲线外凸量(用户选的那档)
 STAM_ARC_GAP = 10         # 段与段之间的缺口
+STAM_ARC_RADIUS = 72      # 右下角那段四分之一圆的半径
 STAM_ARC_WIDTH = 6        # 线宽
 STAM_ARC_TRACK = "#3A3A3A"
 # 2026-11-15 用户定:**三格蓝、两格黄、一格及以下红;力竭一律红**
@@ -1686,25 +1687,33 @@ class SimpleGameTimer(object):
         """
         p1x, p1y = self._arc_p1          # = (主计时器右下角右移后, 主计时器下边缘)
         p2x, p2y = self._arc_p2          # = (第二计时器右边缘, 第二计时器右下角下移后)
+        # 2026-11-16 用户要求:中间那段改成**四分之一圆弧**,其余全是直线。
+        # 圆弧和竖线/横线相切,所以半径 r 的两端各少 r:
+        #   竖直: A → (p1x, p2y - r)
+        #   圆弧: (p1x, p2y - r) → (p1x - r, p2y),圆心 (p1x - r, p2y - r)
+        #   水平: (p1x - r, p2y) → B
+        v_len = abs(p2y - p1y)
+        h_len = abs(p1x - bx)
+        r = min(STAM_ARC_RADIUS, v_len * 0.5, h_len * 0.5)
+        arc_top = (p1x, p2y - r)
+        arc_left = (p1x - r, p2y)
         pts = []
-        # ① 竖直线:A → P1(同一个 x)
-        seg1 = max(2, int(n * 0.30))
+        # ① 竖直线
+        seg1 = max(2, int(n * 0.25))
         for i in range(seg1):
             t = i / float(seg1)
-            pts.append((ax + (p1x - ax) * t, ay + (p1y - ay) * t))
-        # ② 弧 P1 → P2:控制点取右下直角点,切线在两端分别是竖直/水平 → 无折角
-        ctrl = (p1x, p2y)
-        seg2 = max(2, int(n * 0.40))
+            pts.append((p1x, ay + (arc_top[1] - ay) * t))
+        # ② 四分之一圆:圆心 (p1x-r, p2y-r),从 0°(圆的最右点,竖线的切点)
+        #    转到 90°(圆的最下点,横线的切点)
+        seg2 = max(8, int(n * 0.5))
         for i in range(seg2):
-            t = i / float(seg2 - 1)
-            u = 1.0 - t
-            pts.append((u * u * p1x + 2 * u * t * ctrl[0] + t * t * p2x,
-                        u * u * p1y + 2 * u * t * ctrl[1] + t * t * p2y))
-        # ③ 水平线:P2 → B(同一个 y)
-        seg3 = max(2, int(n * 0.30))
+            th = (math.pi / 2) * i / (seg2 - 1.0)
+            pts.append((p1x - r + r * math.cos(th), p2y - r + r * math.sin(th)))
+        # ③ 水平线
+        seg3 = max(2, int(n * 0.25))
         for i in range(1, seg3):
             t = i / float(seg3)
-            pts.append((p2x + (bx - p2x) * t, p2y + (by - p2y) * t))
+            pts.append((arc_left[0] + (bx - arc_left[0]) * t, p2y))
         pts.append((bx, by))
         # 圆头端帽会从端点外鼓 线宽/2 —— 沿路径两端各切掉这么多,
         # 保证「看得见的边」正好落在锚点上,同时竖线/横线仍然是严格垂直/水平的。
