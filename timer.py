@@ -79,18 +79,6 @@ def _config_filename():
     return MODE_CONFIG_FILES[_app_mode()]
 
 
-# 「恢复上次设置」的自动快照:和配置同目录、按配置名派生 —— config.ini →
-# config.prev.ini;timer.ini → timer.prev.ini;stamina.ini → stamina.prev.ini。
-# 2~5 号依次是 *.prev2.ini ~ *.prev5.ini。每次"新的一段调整"开始时五槽轮转,
-# 见 Config.save。这不是垃圾文件,别删。路径由 _prev_slot_path() 统一拼。
-CONFIG_FILENAME = "config.ini"          # 旧名字,仅二合一模式使用(见 MODE_CONFIG_FILES)
-CONFIG_PREV_FILENAME = "config.prev.ini"
-# 快照槽位数(2026-10-14 晚用户要求「记忆功能增加上限至五」):1 号最新,
-# 数字越大越老;「恢复上次设置」连点 = 一层层往回退,最多退到这里。
-CONFIG_PREV_SLOTS = 5
-# 多久没保存才算"新的一段调整"(秒)。连续调整(滚轮连滚几十下)期间不刷新快照,
-# 整段调整只留一个还原点 —— 否则滚一下覆盖一次,「恢复」永远只退最后一步。
-SNAPSHOT_GAP_S = 120.0
 # config.ini **不放程序文件夹**了(2026-10-14 起):改放用户目录
 # %APPDATA%\PhasmophobiaTimer\。程序文件夹从此是纯代码 —— 更新程序只换
 # 文件夹,谁的字号和位置都不会被换掉(旧版就是栽在这上面)。
@@ -535,20 +523,6 @@ def _resolve_config_path():
     return path, False
 
 
-def _prev_slot_path(config_path, i):
-    """第 i 号自动快照的路径(1 = 最新,CONFIG_PREV_SLOTS = 最老)。
-
-    按配置文件名派生:config.ini → config.prev.ini(老用户的单份快照无缝变成
-    1 号);timer.ini → timer.prev.ini;stamina.ini → stamina.prev.ini。
-    2~5 号依次叫 <名字>.prev2.ini ~ .prev5.ini,都和配置同目录。
-    """
-    d = os.path.dirname(config_path)
-    stem = os.path.splitext(os.path.basename(config_path))[0]
-    if i == 1:
-        return os.path.join(d, stem + ".prev.ini")
-    return os.path.join(d, "{}.prev{}.ini".format(stem, i))
-
-
 def _resource_path(name):
     """打包后优先从 _MEIPASS 找随包资源,否则从脚本目录找。"""
     base = getattr(sys, "_MEIPASS", _app_dir())
@@ -979,7 +953,7 @@ def _changed_keys(old_text, new_text):
     return {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
 
 
-def _describe_change(old_text, new_text):
+def _describe_change(old_text, new_text, keys=None):
     """给出「改了哪些设置」的一句话描述(给「更改过程」列表用)。
 
     2026-11-16:编辑模式滚轮会**同时**改三个字号,以前会列三行把面板撑爆,
@@ -987,7 +961,7 @@ def _describe_change(old_text, new_text):
     """
     a = _parse_ini_keys(old_text)
     b = _parse_ini_keys(new_text)
-    keys = _changed_keys(old_text, new_text)
+    keys = keys if keys is not None else _changed_keys(old_text, new_text)
     font_keys = {("Display", "font_size"),
                  ("Display", "timer2_font_size"),
                  ("Display", "status_font_size")}
@@ -1038,103 +1012,14 @@ class Config(object):
         self.path = path
         self.parser = configparser.ConfigParser()
         self.mtime = 0.0
-        # 快照刚建立时调一下(托盘「恢复上次设置」要从灰变亮),由主程序挂上
-        self.snapshot_hook = None
         # 2026-11-16:每次**内容真的变了**的保存,都调一次 history_hook(描述, 新内容)。
         # 主程序用它维护本次运行的「更改过程」列表(只在内存里,关程序清空)。
         self.history_hook = None
-        # 「恢复上次设置」退回后置上:下一次保存先留快照再写 —— 退回的状态
-        # 立刻成为新的还原点,免得"退回后再动手改"把历史挤乱(见 _restore_settings)
-        self.pending_snapshot = False
-        # 「恢复上次设置」已经退到第几层(0 = 还在"现在"),连点逐层回退靠它定位;
-        # 任何保存都清零(动过手 = 回到现在,下次重新从 1 号退起)。⚠️ 别改成拿
-        # config 字节和快照比对来"猜"层数 —— 当前内容可能恰好和某份**更老**的
-        # 快照逐字节相同(如重置回默认位置,恰是同段起点),会以为"已经退到那层"
-        # 而跳过更新的快照(2026-10-14 写测试时实际踩到,pos 用例直接挂)
-        self.restore_depth = 0
+        # (五槽快照 / restore_depth / *.restore 那一套已整段删除)
         self.load()
         # 首次运行就把文件落盘,否则你根本找不到 config.ini 去手改
         if not os.path.exists(self.path):
             self.save()
-        else:
-            # 2026-11-13 晚:上次是"恢复"完直接关的程序 → 这次接着往回退。
-            # 层数存在配置文件旁边的 `<名字>.restore` 里,连同当时文件的指纹,
-            # **别再靠"内容等于哪个快照"去猜**(见 _load_restore_state)。
-            self.restore_depth = self._load_restore_state()
-
-    # ---------- 「恢复上次设置」退到第几层(重启后接着退) ----------
-    def _restore_state_path(self):
-        """层数小状态文件:`config.ini.restore` / `timer.ini.restore` …"""
-        return self.path + ".restore"
-
-    def _file_sig(self):
-        """配置文件的指纹,用来确认状态文件里的层数说的就是现在这份内容。
-
-        手改过配置、从别的机器拷了配置过来 → 指纹对不上 → 层数作废,
-        从"现在"重新开始退(总比退到一个八竿子打不着的快照上强)。
-        ⚠️ 用 `zlib.crc32` 而不是 `hashlib` —— 打包命令里 `--exclude-module hashlib`
-        为了体积把 hashlib 排掉了,真用上会 ImportError。zlib 是 PIL 的依赖,
-        本来就在包里。指纹 = 长度 + CRC32,对"配没被改过"这件事足够。
-        """
-        try:
-            with open(self.path, "rb") as f:
-                data = f.read()
-            return "%d:%08x" % (len(data), zlib.crc32(data) & 0xFFFFFFFF)
-        except OSError:
-            return ""
-
-    def _load_restore_state(self):
-        """读回"上次退到第几层",对不上指纹就是 0。
-
-        ⚠️ 2026-11-13 晚换掉旧做法:以前是拿当前内容和 1~5 号快照逐字节比对,
-        取第一个相同的当成层数。快照里本来就有大量重复内容(旧版空保存留下的、
-        或者"重置回默认位置"绕一圈又回到起点),于是启动就猜错 —— 用户实测
-        连点两次「恢复上次设置」,第二次把第一次的恢复给撤了(往前跳):
-        猜出的层数偏后,中间只要有一次真保存(轮转 + 归零),下一次恢复就会
-        落到比刚才**更新**的那一层。现在记多少就是多少,指纹只负责确认没过期。
-        """
-        try:
-            with open(self._restore_state_path(), encoding="utf-8") as f:
-                depth_s, sig = f.read().split("\n")[:2]
-            depth = int(depth_s)
-        except (OSError, ValueError):
-            return 0
-        if sig.strip() != self._file_sig():
-            return 0
-        depth = max(0, min(depth, CONFIG_PREV_SLOTS))
-        # 2026-11-16 再加一道保险:状态文件说"停在第 N 层",那就要求**当前内容
-        # 确实等于第 N 号快照**。对不上(快照被轮转挤掉、手改过、旧版语义残留…)
-        # 就从 0 开始,免得层数错位导致「退过头 / 跳回去」。
-        if depth:
-            try:
-                with open(self.path, "rb") as f:
-                    cur = f.read()
-                with open(_prev_slot_path(self.path, depth), "rb") as f:
-                    if f.read() != cur:
-                        return 0
-            except OSError:
-                return 0
-        return depth
-
-    def set_restore_depth(self, depth):
-        """改「恢复」层数并落盘(0 = 回到现在,顺手删掉状态文件)。"""
-        self.restore_depth = int(depth)
-        if self.restore_depth <= 0:
-            self.clear_restore_state()
-            return
-        try:
-            tmp = self._restore_state_path() + ".tmp"
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                f.write("%d\n%s\n" % (self.restore_depth, self._file_sig()))
-            os.replace(tmp, self._restore_state_path())
-        except OSError:
-            pass
-
-    def clear_restore_state(self):
-        try:
-            os.remove(self._restore_state_path())
-        except OSError:
-            pass
 
     # ---------- 读 ----------
     def load(self):
@@ -1191,27 +1076,15 @@ class Config(object):
         self.parser.set(sec, key, str(value))
 
     def save(self, force_snapshot=False):
-        # —— 自动快照(托盘「恢复上次设置」的还原点,CONFIG_PREV_SLOTS 个槽位)——
-        # 只在"新的一段调整"开始时刷新:距上次保存 ≥ SNAPSHOT_GAP_S 才动,
-        # 连续调整期间快照一直停在这一段开始前(滚轮连滚几十下也只算一段)。
-        # 刷新 = 五槽轮转:5 号(最老)删掉,4→5、3→4、2→3、1→2,再把保存前的
-        # 整份配置补进 1 号 —— 「恢复上次设置」因此能一层层往回退(见
-        # _restore_settings)。force_snapshot / pending_snapshot = 不管间隔,
-        # 先刷再写(「重置窗口位置」和"退回后再动手改"的第一次保存,见那两处)。
-        # ⚠️ "上次保存时刻"直接用 config.ini 的 mtime,别另存状态变量 ——
-        #    重启、外部改了文件之后照样对。
-        #
-        # 2026-11-13 修:「恢复上次设置」点着像坏的,根子是**空保存**。
-        # 进出编辑模式没挪窗口、滚轮到上限继续滚、点 + 又点 − —— 这些地方都会
-        # 调 save(),但一个值都没变。以前它们照样**重写文件**(刷 mtime,把"一段
-        # 调整"的计时重置)并且**占一个快照槽**(隔 2 分钟以上就轮转一次)。
-        # 实测:真改动 1 次 + 之后 6 次隔 2 分钟的空保存 → 5 个槽全变成同一份
-        # 当前状态,唯一的真还原点被挤掉,点「恢复上次设置」纹丝不动。
-        # 现在两条都堵死:
-        #   ① 渲染出来的文本和盘上一模一样 → 直接返回,不写、不轮转、
-        #      也**不清** pending_snapshot / restore_depth(什么都没改,还算同一段);
-        #   ② 真要写时,1 号槽的内容已经等于盘上这份 → 也不用再轮转,
-        #      别拿重复内容把老历史挤出去。
+        """把当前设置写回配置文件。
+
+        2026-11-16:「更改过程」取代了原来的五槽快照,**快照那套整段删掉**
+        (它只写不读,每次保存白白多做 3~4 次文件操作)。
+        现在只剩一条规则:**内容没变就什么都不做** —— 进出编辑模式没挪窗口、
+        滚轮到上限继续滚,这些"空保存"不该重写文件(会刷新 mtime,并让
+        「更改过程」凭空多出一条记录)。
+        `force_snapshot` 参数保留只为兼容调用点,已经没有任何作用。
+        """
         text = self._render()
         try:
             with open(self.path, encoding="utf-8") as f:
@@ -1219,37 +1092,7 @@ class Config(object):
         except (OSError, UnicodeDecodeError):
             old = None
         if text == old:
-            return                  # 空保存:见上面 ①
-        force = force_snapshot or self.pending_snapshot
-        self.pending_snapshot = False
-        self.restore_depth = 0      # 动过手保存 = 回到"现在",「恢复」下次从 1 号退起
-        self.clear_restore_state()  # 重启后也别接着退:已经动过手了
-        try:
-            if os.path.exists(self.path):
-                s1 = _prev_slot_path(self.path, 1)
-                created = not os.path.exists(s1)
-                same = False
-                if not created:
-                    try:
-                        with open(s1, encoding="utf-8") as f:
-                            same = f.read() == old
-                    except (OSError, UnicodeDecodeError):
-                        same = False
-                if (not same and (created or force
-                                  or time.time() - os.path.getmtime(self.path) >= SNAPSHOT_GAP_S)):
-                    # 轮转:最老的删掉,其余往后挪一格,给"保存前"腾出 1 号
-                    oldest = _prev_slot_path(self.path, CONFIG_PREV_SLOTS)
-                    if os.path.exists(oldest):
-                        os.remove(oldest)
-                    for i in range(CONFIG_PREV_SLOTS - 1, 0, -1):
-                        src = _prev_slot_path(self.path, i)
-                        if os.path.exists(src):
-                            os.replace(src, _prev_slot_path(self.path, i + 1))
-                    shutil.copyfile(self.path, s1)
-                    if created and self.snapshot_hook:
-                        self.snapshot_hook()
-        except OSError:
-            pass
+            return                  # 空保存:什么都不做(见上面的说明)
 
         tmp = self.path + ".tmp"
         try:
@@ -1258,8 +1101,8 @@ class Config(object):
             os.replace(tmp, self.path)
             if self.history_hook:
                 try:
-                    self.history_hook(_describe_change(old, text), text,
-                                      _changed_keys(old, text))
+                    _chg = _changed_keys(old, text)
+                    self.history_hook(_describe_change(old, text, _chg), text, _chg)
                 except Exception:
                     pass
         except OSError:
@@ -1603,7 +1446,6 @@ class SimpleGameTimer(object):
 
         self._start_tray()
         # 快照建立时要刷托盘菜单(「恢复上次设置」从灰变亮),见 Config.save
-        self.cfg.snapshot_hook = self._refresh_tray
         # 「更改过程」:本次运行内逐条记录每次改动(只在内存,关程序清空)。
         # 每条 = 一句描述 + 改动后的整份配置文本;第 0 条是启动时的状态。
         self._history = []
@@ -1779,21 +1621,6 @@ class SimpleGameTimer(object):
     # 删掉的两个是「已 暂 停」和「等待左键」;暂停 / 等待期间状态栏现在不写字。
     STATUS_TEXTS = ("", "已暂停", "等待", PHASE_ATTACK, PHASE_CALM)
 
-    def _status_reserved_width(self):
-        """状态栏按最宽内容预留的宽度。用临时控件实测,不同字体族才准。"""
-        probe = tk.Label(self.root, text="", bd=1, font=(
-            FONT_FAMILY_STATUS, self.cfg.get_int("Display", "status_font_size"), FONT_WEIGHT))
-        widest = 0
-        for txt in self.STATUS_TEXTS:
-            probe.config(text=txt)
-            probe.update_idletasks()
-            widest = max(widest, probe.winfo_reqwidth())
-        probe.destroy()
-        return widest
-
-    # ------------------------------------------------------------------
-    # 体力包边弧(2026-11-15 用户定稿的形态)
-    # ------------------------------------------------------------------
     def _stam_arc_points(self, ax, ay, bx, by, n=220):
         """A→B 的路径(2026-11-15 用户定稿)。
 
@@ -3389,13 +3216,6 @@ class SimpleGameTimer(object):
         self.root.geometry(_fmt_geometry(self.root.winfo_width(),
                                          self.root.winfo_height(),
                                          self._pos[0], self._pos[1]))
-        # 2026-11-16:体力弧画在**另一个窗口**上,拖动时每帧都得跟着挪,
-        # 不然计时器走了弧还停在原地(用户报「体力条没有跟计时器绑定位置」)。
-        self._sync_arc_pos()
-
-    def _sync_arc_pos(self):
-        """体力弧现在画在主窗口里,跟着窗口走,不需要单独同步位置(留个空壳给旧调用点)。"""
-        return
 
     def _on_drag_end(self, event):
         self._drag_offset = None
@@ -3464,12 +3284,8 @@ class SimpleGameTimer(object):
                 pystray.MenuItem("显示第二计时器",
                                  lambda: self._tray_call(self.toggle_timer2),
                                  checked=lambda item: self._timer2_visible))
-        if self._has_timer and self._has_stamina:
-            # 二合一的体力条浮窗开关。checked 和 enabled 一样,是**重建菜单时**
-            # 求值,所以 _toggle_stamina 最后要调 _refresh_tray,否则勾不会变。
-            items.append(
-                pystray.MenuItem("显示体力条", lambda: self._tray_call(self._toggle_stamina),
-                                 checked=lambda item: bool(self.cfg.get_int("Stamina", "enabled"))))
+        # 2026-11-16 用户要求:体力条的设置全部删掉 —— 托盘不再有「显示体力条」,
+        # 体力弧始终显示(固定默认尺寸)。
         # 2026-11-09 用户点名:玩游戏时老是误碰触摸板/屏,要能临时关掉再开回来。
         # 只做进二合一(用户点名「只需要做工具的,其他的不用增加这个功能」)。
         # checked 和别的勾一样是**重建菜单时**求值,toggle 完要 _refresh_tray。
@@ -3498,7 +3314,6 @@ class SimpleGameTimer(object):
             # ~ *.prev5.ini,见 Config.save);点一次往回退一层,再点继续退。
             # 快照由"保存"创建,而菜单重建才刷新置灰:enabled 和上面的 checked 一样,
             # 是**重建菜单时**求值,win32 菜单建一次就复用、不会自己刷 —— Config.save
-            # 建快照时会通过 snapshot_hook 调一次 _refresh_tray,别把那根线剪了。
             # 2026-11-16 用户点名:「恢复上次设置」改成「更改过程」——
             # 点开右侧列表,逐条看改了什么,点哪条就回到哪一版。
             pystray.MenuItem("更改过程", lambda: self._tray_call(self._open_history_panel)),
@@ -3807,37 +3622,8 @@ class SimpleGameTimer(object):
             })
 
         self._hotkey_rows = {}
-        if self._has_stamina:
-            # 体力条那一栏:和热键**同一个交互**(点一行、按新键),但存 [Stamina] 节。
-            # 放在热键上面 —— 它关联的是游戏里的按键,和下面那些"按一下触发一次"的
-            # 热键不是一类东西,分开摆在视觉上更清楚。
-            sec_header("体力条")
-            # 只剩「归满」能改(WASD / Shift / C 是游戏写死的,见 STAM_FIXED_KEYS),
-            # 所以不用再排两列,顺排一行就行。
-            for action, ckey, label in STAMINA_KEYS:
-                self._build_hotkey_row(body, action, section="Stamina",
-                                       config_key=ckey, label=label, compact=True)
-            # 大小:和上面「外观 / 计时」那几行同一套交互(−/+ 或直接输入百分比)。
-            # 编辑模式里在体力条上滚轮也能调,两边改的是同一个 [Stamina] scale。
-            self._build_tweak_row(body, {
-                "key": "stam_scale", "field": "体力条大小", "unit": "%",
-                "lo": STAM_SCALE_MIN, "hi": STAM_SCALE_MAX,
-                "val": lambda: self._stam_scale(),
-                "step": lambda d: self._set_stam_scale(
-                    self._stam_scale() + d * STAM_SCALE_STEP),
-                "set": lambda v: self._set_stam_scale(v),
-            })
-            # 长度(2026-11-09 v2.5 用户点名「增加一个设置可以调体力条的长度」):
-            # 只拉长/压短,条子粗细和字号仍归上面那行「大小」管。
-            self._build_tweak_row(body, {
-                "key": "stam_width", "field": "体力条长度", "unit": "%",
-                "lo": STAM_WIDTH_MIN, "hi": STAM_WIDTH_MAX,
-                "val": lambda: self._stam_width(),
-                "step": lambda d: self._set_stam_width(
-                    self._stam_width() + d * STAM_WIDTH_STEP),
-                "set": lambda v: self._set_stam_width(v),
-            })
-
+        # 2026-11-16 用户要求:体力条的设置项(归满键 / 大小 / 长度)整段删掉。
+        # 体力条本身保留 —— 固定用默认尺寸,归满键仍是出厂 F7。
         if self._has_timer:
             sec_header("热键")
             rows = tk.Frame(body, bg=HK_BG)
@@ -4191,16 +3977,13 @@ class SimpleGameTimer(object):
             return False
 
     def _reset_position(self):
-        """把浮窗挪回默认位置;这一步永远留一个还原点,「恢复上次设置」能精确撤回。
+        """把浮窗挪回默认位置(体力条位置一起清空,回到自动贴左下角)。
 
-        2026-10-14:起先靠 window_x_prev / window_y_prev 记位置 + 单独的
-        「恢复上次位置」;同日晚用户要求「能改的全部设置都要能恢复」,并点名
-        「包含的话就把恢复上次位置删了」—— 位置并进整份快照:这里走
-        save(force_snapshot=True),快照 = 保存前的整份配置 = **点重置前
-        一瞬间**的状态,连位置带字号透明度一起,精确撤回(见 Config.save)。
-        已经在默认位置再点 = 什么都没发生,那次保存**不强制**刷快照 ——
-        免得白丢当前一段调整的还原点。
+        2026-11-16:原来这里靠 `save(force_snapshot=True)` 给「恢复上次设置」
+        留还原点;快照机制已删,现在只要把新位置存进配置 ——
+        「更改过程」会照常把这次改动记成一条「窗口位置」。
         """
+
         cur = (self.cfg.get_int("Display", "window_x"),
                self.cfg.get_int("Display", "window_y"))
         default_pos = (int(DEFAULTS["Display"]["window_x"]),
@@ -4218,7 +4001,7 @@ class SimpleGameTimer(object):
         if self._has_stamina:
             self.cfg.set("Stamina", "x", "")
             self.cfg.set("Stamina", "y", "")
-        self.cfg.save(force_snapshot=moved)
+        self.cfg.save()
         if self._has_timer:
             self._relayout()
         if self._has_stamina:
@@ -4229,89 +4012,6 @@ class SimpleGameTimer(object):
         # 2026-10-14 晚用户要求:原「已重置位置,可恢复」太长,缩短成「已重置」。
         # 2026-11-13:改走 _flash_status —— 老写法的提示会被 _tick 下一帧抹掉。
         self._flash_status("已重置" if moved else "已在默认位置")
-
-    def _prev_settings_path(self):
-        """1 号快照(最新那份)的路径;托盘「恢复上次设置」的置灰就看它在不在。"""
-        return _prev_slot_path(self.cfg.path, 1)
-
-    def _restore_settings(self):
-        """整份设置往回退一层(托盘点一次退一层,最多 CONFIG_PREV_SLOTS 层)。
-
-        快照 = config.ini 旁边五槽轮转的历史(config.prev.ini ~ config.prev5.ini,
-        见 Config.save),每份 = 某"一段调整"开始前的整份配置。退到哪层看
-        Config.restore_depth(每次成功回退 +1,任何保存清零 = 回到"现在");
-        逐字节和当前一样的槽位自动跳过 —— 重启后正停在某层、或退回后同段重复
-        保存都可能产生这种重复槽,退它屏幕上看不出变化,像点了没反应。连点 =
-        一层层往回退,撞到底提示「没有更早的设置」。退回后置 pending_snapshot:
-        再动手改的第一次保存会先把"退回的状态"留成新快照,不会白退。
-
-        2026-11-13:restore_depth 只在内存里,**重启就归零**。以前重启后再点
-        「恢复」会从 1 号退起 —— 而 1 号往往正是"刚才退掉的那个较新状态",
-        于是点下去反而**往前跳**。现在层数连同文件指纹存在配置旁边的
-        `<名字>.restore`(见 `Config.set_restore_depth` / `_load_restore_state`),
-        重启后原样接上。⚠️ 别改回"拿当前内容和快照比对猜层数"—— 快照里重复
-        内容很多,猜出来的层数会错位(2026-11-13 用户实测:第二次恢复把第一次
-        的恢复撤了)。任何真保存都会清零(`Config.save`)。
-        """
-        path = self.cfg.path
-        try:
-            cur = open(path, "rb").read()
-        except OSError:
-            cur = None
-        # 2026-11-16 修「退过头 / 跳回去」:
-        # 老快照里有**重复内容**(同一份设置出现在多个槽里,中间的槽内容又不一样),
-        # 以前只跳过"和现在完全一样"的槽,于是:
-        #   第 1 次退到某个槽 → 第 2 次遇到"内容等于第 1 次之前那份"的槽,
-        #   直接把用户送回原处(用户看到的就是"跳回去")。
-        # 现在改成:从当前层往后走,**凡是内容已经见过的一律跳过**,只认第一个
-        # 没见过的状态;剩下的内容重复的槽不占层。
-        depth = self.cfg.restore_depth
-        seen = set()
-        if cur is not None:
-            seen.add(cur)
-        # 还要把**已经退过的那几层**的内容也算作"见过" —— 否则老快照里的重复
-        # 内容(比如 3 号槽和 1 号槽一模一样)会被当成新状态,一点就跳回原处。
-        for k in range(1, depth + 1):
-            try:
-                seen.add(open(_prev_slot_path(path, k), "rb").read())
-            except OSError:
-                pass
-        src = None
-        d = depth
-        while d < CONFIG_PREV_SLOTS:
-            nxt = _prev_slot_path(path, d + 1)
-            if not os.path.exists(nxt):
-                break
-            try:
-                data = open(nxt, "rb").read()
-            except OSError:
-                break
-            d += 1
-            if data in seen:
-                continue            # 这份内容已经见过了:跳过,不占一层
-            seen.add(data)
-            src, depth = nxt, d
-            break
-        if src is None:
-            # ⚠️ 别再用「config(text=...) + after(...)」的老写法:_tick 下一帧
-            # 会调 _update_status_label 把它抹掉,提示等于看不见(2026-11-13 修,
-            # 和 2026-11-10 F8 提示语一闪就没是同一个坑)。
-            self._flash_status("没有更早的设置" if depth else "还没有可恢复的设置")
-            return
-        try:
-            shutil.copyfile(src, path)
-        except OSError:
-            self._flash_status("恢复失败")
-            return
-        self.cfg.restore_depth = depth
-        self.cfg.pending_snapshot = True
-        self._reload_from_disk()
-        # 还原换掉了整份配置(编辑模式可能被 _reload_from_disk 进出过),托盘状态跟着刷
-        self._refresh_tray()
-        # 层数连同**恢复后**的文件指纹落盘:重启后接着往回退,不用再猜
-        self.cfg.set_restore_depth(depth)
-        # 2026-10-14 晚用户要求:这句太长,就闪「已恢复」(原「已恢复上次设置」)
-        self._flash_status("已恢复")
 
     # ==================================================================
     # 改键捕获
