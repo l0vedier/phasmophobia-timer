@@ -938,6 +938,95 @@ def _set_timer_precision(hi_res):
 # ----------------------------------------------------------------------
 # 配置
 # ----------------------------------------------------------------------
+# 2026-11-16 「更改过程」用:把配置里变化的键翻译成一句人话。
+_CHANGE_LABELS = {
+    ("Display", "opacity"): "透明度",
+    ("Display", "font_size"): "主计时器字号",
+    ("Display", "timer2_font_size"): "第二计时器字号",
+    ("Display", "status_font_size"): "状态文字字号",
+    ("Display", "timer2_visible"): "显示第二计时器",
+    ("Display", "window_x"): "窗口位置",
+    ("Display", "window_y"): "窗口位置",
+    ("Stamina", "enabled"): "显示体力条",
+    ("Stamina", "scale"): "体力条大小",
+    ("Stamina", "width"): "体力条长度",
+    ("Stamina", "x"): "体力条位置",
+    ("Stamina", "y"): "体力条位置",
+}
+_POS_KEYS = {("Display", "window_x"), ("Display", "window_y"),
+             ("Stamina", "x"), ("Stamina", "y")}
+
+
+def _parse_ini_keys(text):
+    """把 ini 文本拆成 {(节, 键): 值},忽略注释。"""
+    out = {}
+    sec = ""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            sec = line[1:-1]
+            continue
+        if "=" in line and not line.startswith(("#", ";")) and "[" not in line:
+            k, v = line.split("=", 1)
+            out[(sec, k.strip())] = v.strip()
+    return out
+
+
+def _changed_keys(old_text, new_text):
+    """返回变化的键集合 {(节, 键)}。"""
+    a = _parse_ini_keys(old_text)
+    b = _parse_ini_keys(new_text)
+    return {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+
+
+def _describe_change(old_text, new_text):
+    """给出「改了哪些设置」的一句话描述(给「更改过程」列表用)。
+
+    2026-11-16:编辑模式滚轮会**同时**改三个字号,以前会列三行把面板撑爆,
+    现在合并成一句「字号 → 70」;同类位置键也只留一句「窗口位置」。
+    """
+    a = _parse_ini_keys(old_text)
+    b = _parse_ini_keys(new_text)
+    keys = _changed_keys(old_text, new_text)
+    font_keys = {("Display", "font_size"),
+                 ("Display", "timer2_font_size"),
+                 ("Display", "status_font_size")}
+    hit_fonts = keys & font_keys
+    parts = []
+    if len(hit_fonts) >= 2:
+        val = b.get(("Display", "font_size"), "")
+        parts.append("字号 → %s" % val if val else "字号")
+        keys -= hit_fonts
+    done_labels = set()
+    for key in sorted(keys):
+        sec, k = key
+        label = _CHANGE_LABELS.get(key)
+        if label is None:
+            if sec == "Hotkeys":
+                label = "热键 " + k
+            elif sec == "Stamina" and k.startswith("key_"):
+                label = "体力按键 " + k[4:]
+            else:
+                label = "%s.%s" % (sec, k)
+        new_val = b.get(key, "")
+        if key in _POS_KEYS:
+            text = label
+        elif key == ("Display", "timer2_visible") or key == ("Stamina", "enabled"):
+            text = "%s %s" % (label, "开" if new_val == "1" else "关")
+        elif new_val:
+            text = "%s → %s" % (label, new_val)
+        else:
+            text = label
+        if text in done_labels or text in parts:
+            continue
+        done_labels.add(text)
+        parts.append(text)
+    # 实在太多(>3 条)就收成一句,免得面板一行放不下
+    if len(parts) > 3:
+        return "%d 处设置" % len(parts)
+    return "、".join(parts) if parts else "设置"
+
+
 class Config(object):
     """config.ini 的读写。
 
@@ -951,6 +1040,9 @@ class Config(object):
         self.mtime = 0.0
         # 快照刚建立时调一下(托盘「恢复上次设置」要从灰变亮),由主程序挂上
         self.snapshot_hook = None
+        # 2026-11-16:每次**内容真的变了**的保存,都调一次 history_hook(描述, 新内容)。
+        # 主程序用它维护本次运行的「更改过程」列表(只在内存里,关程序清空)。
+        self.history_hook = None
         # 「恢复上次设置」退回后置上:下一次保存先留快照再写 —— 退回的状态
         # 立刻成为新的还原点,免得"退回后再动手改"把历史挤乱(见 _restore_settings)
         self.pending_snapshot = False
@@ -1009,7 +1101,20 @@ class Config(object):
             return 0
         if sig.strip() != self._file_sig():
             return 0
-        return max(0, min(depth, CONFIG_PREV_SLOTS))
+        depth = max(0, min(depth, CONFIG_PREV_SLOTS))
+        # 2026-11-16 再加一道保险:状态文件说"停在第 N 层",那就要求**当前内容
+        # 确实等于第 N 号快照**。对不上(快照被轮转挤掉、手改过、旧版语义残留…)
+        # 就从 0 开始,免得层数错位导致「退过头 / 跳回去」。
+        if depth:
+            try:
+                with open(self.path, "rb") as f:
+                    cur = f.read()
+                with open(_prev_slot_path(self.path, depth), "rb") as f:
+                    if f.read() != cur:
+                        return 0
+            except OSError:
+                return 0
+        return depth
 
     def set_restore_depth(self, depth):
         """改「恢复」层数并落盘(0 = 回到现在,顺手删掉状态文件)。"""
@@ -1151,6 +1256,12 @@ class Config(object):
             with open(tmp, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             os.replace(tmp, self.path)
+            if self.history_hook:
+                try:
+                    self.history_hook(_describe_change(old, text), text,
+                                      _changed_keys(old, text))
+                except Exception:
+                    pass
         except OSError:
             try:
                 os.remove(tmp)
@@ -1493,6 +1604,19 @@ class SimpleGameTimer(object):
         self._start_tray()
         # 快照建立时要刷托盘菜单(「恢复上次设置」从灰变亮),见 Config.save
         self.cfg.snapshot_hook = self._refresh_tray
+        # 「更改过程」:本次运行内逐条记录每次改动(只在内存,关程序清空)。
+        # 每条 = 一句描述 + 改动后的整份配置文本;第 0 条是启动时的状态。
+        self._history = []
+        self._hist_pos = 0
+        self._hist_win = None
+        self._hist_cv = None
+        try:
+            self._history.append({"desc": "启动时的设置",
+                                  "text": self.cfg._render(),
+                                  "ts": time.time(), "keys": set()})
+        except Exception:
+            pass
+        self.cfg.history_hook = self._on_config_changed
         self._start_listeners()
 
         self.root.protocol("WM_DELETE_WINDOW", self.close_program)
@@ -1626,17 +1750,11 @@ class SimpleGameTimer(object):
         # 为什么不用主窗口里的 Canvas:主窗口的标签有实底(#1A1A1A),Tk 会先用
         # 标签底色把 Canvas 盖掉,弧穿过标签框的地方直接消失(实测左下那段被吃掉)。
         # 单独一个置顶透明窗盖在计时器上面,就没有遮挡问题。
-        self.arc_win = tk.Toplevel(self.root)
-        self.arc_win.overrideredirect(True)
-        self.arc_win.attributes("-topmost", True)
-        self.arc_win.configure(bg=COLOR_BG)
-        self.arc_cv = tk.Canvas(self.arc_win, bg=COLOR_BG, highlightthickness=0, bd=0)
-        self.arc_cv.pack(fill="both", expand=True)
-        # 弧窗是"没有标题栏的置顶窗",但它可能变成进程的 MainWindowHandle ——
-        # 重启脚本按 WM_CLOSE 关程序时会打到它身上,不接这条就关不掉(2026-11-15 实测)。
-        self.arc_win.protocol("WM_DELETE_WINDOW", self.close_program)
-        self.arc_win.withdraw()
-        _no_taskbar(self.arc_win)
+        # 2026-11-16:改回**主窗口内的画布**。独立弧窗那套在这台机器上换来的是
+        # z-order 打架(拖动时被主窗盖住)和反复 lift 造成的闪烁,干脆不要了。
+        # 画布底色 = 透明色 #1A1A1A,铺满窗口后压在标签下面:弧只从空白处露出来。
+        # 现在弧在数字外侧 24px,不会落进标签的实心底框,所以不会被盖掉。
+        self.arc_cv = tk.Canvas(self.root, bg=COLOR_BG, highlightthickness=0, bd=0)
         self._arc_geom = None          # (A, B, 点集),由 _relayout 算好存着
 
         # 编辑模式用的边框和提示(默认不显示)
@@ -1659,7 +1777,7 @@ class SimpleGameTimer(object):
     PHASE_CALM = "平静"
     # 2026-11-15 用户要求:超过两个字的提示词全部删除。
     # 删掉的两个是「已 暂 停」和「等待左键」;暂停 / 等待期间状态栏现在不写字。
-    STATUS_TEXTS = ("", "等待", PHASE_ATTACK, PHASE_CALM)
+    STATUS_TEXTS = ("", "已暂停", "等待", PHASE_ATTACK, PHASE_CALM)
 
     def _status_reserved_width(self):
         """状态栏按最宽内容预留的宽度。用临时控件实测,不同字体族才准。"""
@@ -1794,6 +1912,13 @@ class SimpleGameTimer(object):
             col = STAM_ARC_YELLOW
         else:
             col = STAM_ARC_BLUE
+        if self.edit_mode:
+            # 编辑模式的青色边框(和主窗口 edit_border 同一个青)
+            try:
+                cv.create_rectangle(1, 1, cv.winfo_width() - 1, cv.winfo_height() - 1,
+                                    outline=HK_ACCENT, width=2)
+            except tk.TclError:
+                pass
         for k, seg in enumerate(self._stam_arc_thirds(geom[4])):
             if len(seg) < 2:
                 continue
@@ -1812,6 +1937,175 @@ class SimpleGameTimer(object):
                 flat2 = [c for p in seg[-n:] for c in (round(p[0]), round(p[1]))]
                 cv.create_line(*flat2, fill=col, width=STAM_ARC_WIDTH,
                                capstyle="round", joinstyle="round")
+
+    # ==================================================================
+    # 更改过程(2026-11-16 用户要求):逐条记录改动,可跳到任意一版
+    # ==================================================================
+    def _on_config_changed(self, desc, text, keys=None):
+        """Config.save() 里"内容真的变了"时回调:记一条,并清掉"未来"。"""
+        try:
+            if self._hist_pos < len(self._history) - 1:
+                # 用户回退过,然后又动手改了 → 比当前更新的记录全部作废
+                del self._history[self._hist_pos + 1:]
+            self._history.append({"desc": desc, "text": text,
+                                  "ts": time.time(), "keys": set(keys or ())})
+            self._hist_pos = len(self._history) - 1
+            self._refresh_history_panel()
+        except Exception:
+            pass
+
+    def _open_history_panel(self):
+        """托盘「更改过程」:右侧弹出列表(最下面是最近一次)。"""
+        win = getattr(self, "_hist_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    self._refresh_history_panel()
+                    return
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=HK_BORDER)
+        win.protocol("WM_DELETE_WINDOW", self._close_history_panel)
+        cv = tk.Canvas(win, bg=HK_BG, highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True, padx=1, pady=1)
+        cv.bind("<Button-1>", self._on_history_click)
+        cv.bind("<MouseWheel>", self._on_history_wheel)
+        win.bind("<Button-3>", lambda e: self._close_history_panel())
+        _no_taskbar(win)
+        self._hist_win, self._hist_cv = win, cv
+        self._refresh_history_panel()
+
+    def _close_history_panel(self):
+        win = getattr(self, "_hist_win", None)
+        self._hist_win = None
+        self._hist_cv = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _hist_pos_text(self, text):
+        """从某条记录的配置文本里取出窗口位置,给右侧那列显示。"""
+        try:
+            keys = _parse_ini_keys(text)
+            x = keys.get(("Display", "window_x"), "?")
+            y = keys.get(("Display", "window_y"), "?")
+            return "%s, %s" % (x, y)
+        except Exception:
+            return ""
+
+    def _refresh_history_panel(self):
+        """重画「更改过程」面板:好看一点 + 右侧显示那一版窗口的具体坐标。"""
+        cv = getattr(self, "_hist_cv", None)
+        if cv is None:
+            return
+        try:
+            if not cv.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        w = 460
+        row_h = 28
+        n = max(1, len(self._history))
+        h = min(640, 76 + row_h * n)
+        cv.delete("all")
+        cv.config(width=w, height=h, scrollregion=(0, 0, w, 76 + row_h * n))
+
+        # 顶部:标题 + 条数
+        cv.create_text(16, 20, anchor="w", text="更改过程", fill=HK_TEXT,
+                       font=(FONT_FAMILY_STATUS, 11, "bold"))
+        cv.create_text(w - 16, 20, anchor="e",
+                       text="共 %d 条 · 右键关闭" % len(self._history),
+                       fill=HK_DIM, font=(FONT_FAMILY_STATUS, 8))
+        cv.create_line(16, 38, w - 16, 38, fill=HK_BORDER)
+
+        # 列头
+        cv.create_text(52, 48, anchor="w", text="改了什么", fill=HK_DIM,
+                       font=(FONT_FAMILY_STATUS, 8))
+        cv.create_text(w - 16, 48, anchor="e", text="窗口位置", fill=HK_DIM,
+                       font=(FONT_FAMILY_STATUS, 8))
+
+        self._hist_rows_y = []
+        y = 66
+        for idx, ent in enumerate(self._history):
+            is_cur = (idx == self._hist_pos)
+            top = y
+            bot = y + row_h
+            # 斑马纹底 + 当前条目彩色底
+            if is_cur:
+                cv.create_rectangle(8, top, w - 8, bot, fill="#22322F", outline="")
+                cv.create_rectangle(8, top, 11, bot, fill=HK_ACCENT, outline="")
+            elif idx % 2 == 0:
+                cv.create_rectangle(8, top, w - 8, bot, fill="#202020", outline="")
+            # 序号
+            cv.create_text(20, (top + bot) / 2, anchor="w", text="#%d" % idx,
+                           fill=HK_ACCENT if is_cur else HK_DIM,
+                           font=(FONT_FAMILY_STATUS, 9, "bold" if is_cur else "normal"))
+            # 描述
+            cv.create_text(52, (top + bot) / 2, anchor="w", text=ent["desc"],
+                           fill=HK_TEXT if not is_cur else HK_ACCENT,
+                           font=(FONT_FAMILY_STATUS, 9, "bold" if is_cur else "normal"))
+            # 右侧:只有这一条改动里**真的动了位置**才显示坐标
+            pos_keys = ent.get("keys") or set()
+            show_pos = bool(pos_keys & _POS_KEYS)
+            cv.create_text(w - 16, (top + bot) / 2, anchor="e",
+                           text=(self._hist_pos_text(ent["text"]) if show_pos else ""),
+                           fill=HK_ACCENT if is_cur else HK_DIM,
+                           font=("Consolas", 9, "bold" if is_cur else "normal"))
+            self._hist_rows_y.append((idx, top, bot))
+            y = bot
+
+        # 摆到屏幕右侧
+        left, top_, right, bottom = _work_area()
+        if right - left > 0:
+            x = max(left, right - w - 24)
+            y0 = top_ + 80
+        else:
+            x, y0 = 40, 80
+        self._hist_win.geometry(_fmt_geometry(w, h, x, y0))
+        self._hist_win.deiconify()
+        self._hist_win.lift()
+
+    def _on_history_click(self, event):
+        cv = getattr(self, "_hist_cv", None)
+        if cv is None:
+            return
+        y = cv.canvasy(event.y)
+        for idx, y0, y1 in getattr(self, "_hist_rows_y", []):
+            if y0 <= y <= y1:
+                self._apply_history(idx)
+                return
+
+    def _on_history_wheel(self, event):
+        cv = getattr(self, "_hist_cv", None)
+        if cv is None:
+            return
+        cv.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _apply_history(self, idx):
+        """回到第 idx 条记录(整份设置)。不产生新的历史条目。"""
+        if not (0 <= idx < len(self._history)):
+            return
+        ent = self._history[idx]
+        try:
+            with open(self.cfg.path, "w", encoding="utf-8", newline=chr(10)) as f:
+                f.write(ent["text"])
+        except OSError:
+            self._flash_status("恢复失败")
+            return
+        self._hist_pos = idx
+        self.cfg.load()
+        self._reload_from_disk()
+        self._refresh_tray()
+        self._refresh_history_panel()
+        # 2026-11-16 用户要求:点完列表不要在计时器上弹「已回到 #N」这类状态提示,
+        # 点哪条哪条变青就够了。
 
     def _relayout(self):
         """按当前字号重新摆放控件,并保证窗口足够大。"""
@@ -1851,7 +2145,22 @@ class SimpleGameTimer(object):
                     "00"))
             except tk.TclError:
                 w00 = 0
-            status_x = main_ink_right - w00 / 2.0
+            # 2026-11-16 用户要求:状态文字以**秒表的中心轴**为对称轴
+            # (按秒表显示两位数时的宽度算)。
+            # 秒表是 anchor="ne" 摆在主计时器右缘的,所以它的中心 =
+            # 右缘 - 「两位数的宽度」/2。
+            try:
+                w2 = int(self.root.tk.call(
+                    "font", "measure",
+                    (FONT_FAMILY, self.cfg.get_int("Display", "font_size"), FONT_WEIGHT),
+                    "88"))
+            except tk.TclError:
+                w2 = 0
+            # 秒表是 anchor="ne" 摆在主计时器**标签框**右缘的,
+            # 但它的**墨迹**右缘还要再减去 bd+padx(11)。
+            # 用框的右缘算会整体偏右 11px(用户 2026-11-16:「很明显是歪的」)。
+            sec_ink_right = 20 + self.time_label.winfo_reqwidth() - 11
+            status_x = sec_ink_right - w2 / 2.0
 
             # y 要让两者的**墨迹底边齐平**。
             #
@@ -1886,11 +2195,19 @@ class SimpleGameTimer(object):
         self.status_label.place(x=status_x, y=status_y, anchor="n")
         self.root.update_idletasks()
 
-        need_w = max(self.cfg.get_int("Display", "window_w"),
-                     40 + self.time_label.winfo_reqwidth() + self.sec_label.winfo_reqwidth(),
+        # 2026-11-16:编辑模式里**不**套用配置里的窗口宽高做下限 ——
+        # 那块"实心底板"会跟着配置的宽高一起变大,右边空出一截(用户:
+        # 「编辑模式右边凸出来了一块」)。编辑时窗口严格贴住内容。
+        floor_w = 0 if self.edit_mode else self.cfg.get_int("Display", "window_w")
+        floor_h = 0 if self.edit_mode else self.cfg.get_int("Display", "window_h")
+        # 秒表没显示时不要它的宽度 —— 否则窗口右边会白白空出一截
+        # (用户 2026-11-16:「编辑模式右边凸出来了一块」就是它)。
+        sec_w = self.sec_label.winfo_reqwidth() if self.show_sec_mode else 0
+        need_w = max(floor_w,
+                     40 + self.time_label.winfo_reqwidth() + sec_w,
                      status_x + 20)
 
-        need_h = max(self.cfg.get_int("Display", "window_h"),
+        need_h = max(floor_h,
                      status_y + self.status_label.winfo_reqheight() + 12)
         if self._timer2_visible:
             need_h = max(need_h, t2_y + self.time_label2.winfo_reqheight() + 12)
@@ -1941,41 +2258,44 @@ class SimpleGameTimer(object):
             self._arc_p1 = (main_right + STAM_ARC_OUT_X, main_bottom)
             self._arc_p2 = (sub_right, sub_bottom + STAM_ARC_OUT_Y)
             pts = self._stam_arc_points(ax, ay, bx, by)
-            need_w = max(need_w, int(max(x for x, _y in pts)) + 10)
-            need_h = max(need_h, int(max(y for _x, y in pts)) + 10)
+            # 2026-11-16:边距统一 —— 左边内容距窗口边是 20(数字标签 x=20),
+            # 上下右也留 20,编辑模式的框看起来才匀(用户:「就按左边多出来的那个大小」)。
+            # 左边内容(数字墨迹)距窗口左边 = 20 + 11(bd+padx) = 31,
+            # 右边、下边也用同样的 31,四个方向看起来才一样宽(用户 2026-11-16)。
+            need_w = max(need_w, int(max(x for x, _y in pts)) + 31)
+            need_h = max(need_h, int(max(y for _x, y in pts)) + 31)
             self._arc_geom = (ax, ay, bx, by, pts)
         else:
             self._arc_geom = None
         self.root.geometry(_fmt_geometry(need_w, need_h, self._pos[0], self._pos[1]))
 
         if self.edit_mode:
-            self.edit_hint.place(relx=0.5, y=need_h - 26, anchor="n")
-            self.edit_border.place(x=0, y=0, width=need_w, height=need_h)
+            # 有体力弧时提示语挪到**顶部**:底部那条水平弧会被提示语的实心底色盖住。
+            self.edit_hint.place(relx=0.5, y=(2 if arc_on else need_h - 26), anchor="n")
+            if arc_on:
+                # 有弧画布时,边框由画布自己画(见 _draw_stam_arc)——
+                # 否则这个实心 Frame 会把画布整个盖住,编辑模式看不到体力条。
+                self.edit_border.place_forget()
+            else:
+                self.edit_border.place(x=0, y=0, width=need_w, height=need_h)
 
         # 设 -alpha / -transparentcolor 会把扩展样式重建(TOOLWINDOW 位丢),
         # 每次 relayout 之后统一补一次,保证两个窗口都不占任务栏。
         _no_taskbar(self.root)
-        if getattr(self, "arc_win", None) is not None:
-            _no_taskbar(self.arc_win)
 
-        # 弧窗和计时器窗同尺寸同位置,盖在它上面
+        # 弧画布铺满窗口、压在标签下面:标签有实心底色,会盖住画布;
+        # 弧走在数字外侧的空白里,所以不会被遮挡。
         if arc_on:
             try:
                 self.arc_cv.config(width=need_w, height=need_h)
-                self.arc_win.attributes(
-                    "-alpha", max(0.1, min(1.0, self.cfg.get_float("Display", "opacity"))))
-                self.arc_win.attributes("-transparentcolor", COLOR_BG)
-                self.arc_win.geometry(_fmt_geometry(need_w, need_h,
-                                                    self._pos[0], self._pos[1]))
-                if not self.arc_win.winfo_ismapped() and self.root.winfo_ismapped():
-                    self.arc_win.deiconify()
-                self.arc_win.attributes("-topmost", True)
+                self.arc_cv.place(x=0, y=0, width=need_w, height=need_h)
+                self.arc_cv.tk.call("lower", self.arc_cv._w)
             except tk.TclError:
                 pass
             self._draw_stam_arc()
         else:
             try:
-                self.arc_win.withdraw()
+                self.arc_cv.place_forget()
             except tk.TclError:
                 pass
 
@@ -2211,8 +2531,10 @@ class SimpleGameTimer(object):
             return
         if self._capturing:
             self.status_label.config(text="请按键…")
-        # 2026-11-15:「已 暂 停」按用户要求删除(暂停时状态栏空白);
-        # 「等待左键」缩短成「等待」保留 —— 超过两个字的提示词都不要。
+        # 2026-11-16:用户要求把「已暂停」改回来 —— 当时删它是怕状态文字超出范围,
+        # 现在状态文字改成"中心对齐右边那两个 0",三四个字也不会顶出去。
+        elif self.state == "paused" and not self.force_hide_pause_text:
+            self.status_label.config(text="已暂停")
         elif self.timer2_waiting:
             self.status_label.config(text="等待" if self.timer2_armed else "")
         elif self.state2 == "counting_up":
@@ -2379,9 +2701,11 @@ class SimpleGameTimer(object):
             return
         if not self.stam_enabled:
             self._stop_stamina()
-            # 2026-11-15:二合一的体力画在**独立的弧窗**上,托盘取消勾选时
-            # 光停浮窗没用,弧还在 —— 这里也要把它收掉(用户报「隐藏按钮失效」)。
+            # 2026-11-16:弧画在主窗口里,取消勾选时要把整窗重画一遍 ——
+            # 只清画布不够,窗口还留着为弧撑大的那块空白(用户要求「重画所有的」)。
             self._hide_arc()
+            if self._has_timer:
+                self._relayout()
             return
         if self._has_timer:
             # 2026-11-15:二合一里体力画在计时器窗口的包边弧上,浮窗不再显示
@@ -2402,11 +2726,12 @@ class SimpleGameTimer(object):
 
     def _hide_arc(self):
         """把包边弧的浮窗收起来(体力条被关掉时用)。"""
-        win = getattr(self, "arc_win", None)
-        if win is None:
+        cv = getattr(self, "arc_cv", None)
+        if cv is None:
             return
         try:
-            win.withdraw()
+            cv.delete("all")
+            cv.place_forget()
         except tk.TclError:
             pass
 
@@ -3010,6 +3335,8 @@ class SimpleGameTimer(object):
         # 体力条工具里只有这一段 —— 计时器窗口根本没上屏(见 __init__)。
         self._apply_stamina_style()
         self._bind_stam_drag(True)
+        # 编辑模式的窗口尺寸和普通模式不同(不套配置宽高),切进来要重排一次
+        self._relayout()
         self._refresh_tray()
 
     def _exit_edit_mode(self, save=True):
@@ -3024,6 +3351,8 @@ class SimpleGameTimer(object):
             _no_taskbar(self.root)      # 同上,补一次
         self._bind_stam_drag(False)
         self._apply_stamina_style()
+        if self._has_timer:
+            self._relayout()      # 退出编辑模式:窗口恢复成配置里的宽高
 
         if save and self._has_timer:
             self.cfg.set("Display", "window_x", self._pos[0])
@@ -3060,6 +3389,13 @@ class SimpleGameTimer(object):
         self.root.geometry(_fmt_geometry(self.root.winfo_width(),
                                          self.root.winfo_height(),
                                          self._pos[0], self._pos[1]))
+        # 2026-11-16:体力弧画在**另一个窗口**上,拖动时每帧都得跟着挪,
+        # 不然计时器走了弧还停在原地(用户报「体力条没有跟计时器绑定位置」)。
+        self._sync_arc_pos()
+
+    def _sync_arc_pos(self):
+        """体力弧现在画在主窗口里,跟着窗口走,不需要单独同步位置(留个空壳给旧调用点)。"""
+        return
 
     def _on_drag_end(self, event):
         self._drag_offset = None
@@ -3163,8 +3499,9 @@ class SimpleGameTimer(object):
             # 快照由"保存"创建,而菜单重建才刷新置灰:enabled 和上面的 checked 一样,
             # 是**重建菜单时**求值,win32 菜单建一次就复用、不会自己刷 —— Config.save
             # 建快照时会通过 snapshot_hook 调一次 _refresh_tray,别把那根线剪了。
-            pystray.MenuItem("恢复上次设置", lambda: self._tray_call(self._restore_settings),
-                             enabled=lambda item: os.path.exists(self._prev_settings_path())),
+            # 2026-11-16 用户点名:「恢复上次设置」改成「更改过程」——
+            # 点开右侧列表,逐条看改了什么,点哪条就回到哪一版。
+            pystray.MenuItem("更改过程", lambda: self._tray_call(self._open_history_panel)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", lambda: self._tray_call(self.close_program)),
         ]
@@ -3242,7 +3579,7 @@ class SimpleGameTimer(object):
             self._flash_status("需要管理员权限", 2600)
             return False
         self._touch_busy = True
-        self._flash_status("正在禁用触摸板…" if off else "正在恢复触摸板…", 5000)
+        # 2026-11-16 用户要求:切换过程中不要任何提示,只在真正完成后闪「已禁用/已恢复」。
         off = bool(off)
 
         def work():
@@ -3271,7 +3608,7 @@ class SimpleGameTimer(object):
         self._touch_busy = False
         if ok:
             self._touch_off = bool(off)
-            self._flash_status("触摸板已禁用" if off else "触摸板已恢复")
+            self._flash_status("已禁用" if off else "已恢复")
         else:
             # 失败也别自作主张改 _touch_off:设备到底什么状态,_touch_scan 说了算
             self._touch_off = _touch_any_disabled()
@@ -3921,19 +4258,41 @@ class SimpleGameTimer(object):
             cur = open(path, "rb").read()
         except OSError:
             cur = None
+        # 2026-11-16 修「退过头 / 跳回去」:
+        # 老快照里有**重复内容**(同一份设置出现在多个槽里,中间的槽内容又不一样),
+        # 以前只跳过"和现在完全一样"的槽,于是:
+        #   第 1 次退到某个槽 → 第 2 次遇到"内容等于第 1 次之前那份"的槽,
+        #   直接把用户送回原处(用户看到的就是"跳回去")。
+        # 现在改成:从当前层往后走,**凡是内容已经见过的一律跳过**,只认第一个
+        # 没见过的状态;剩下的内容重复的槽不占层。
         depth = self.cfg.restore_depth
-        while depth < CONFIG_PREV_SLOTS:
-            nxt = _prev_slot_path(path, depth + 1)
+        seen = set()
+        if cur is not None:
+            seen.add(cur)
+        # 还要把**已经退过的那几层**的内容也算作"见过" —— 否则老快照里的重复
+        # 内容(比如 3 号槽和 1 号槽一模一样)会被当成新状态,一点就跳回原处。
+        for k in range(1, depth + 1):
+            try:
+                seen.add(open(_prev_slot_path(path, k), "rb").read())
+            except OSError:
+                pass
+        src = None
+        d = depth
+        while d < CONFIG_PREV_SLOTS:
+            nxt = _prev_slot_path(path, d + 1)
             if not os.path.exists(nxt):
                 break
             try:
-                if open(nxt, "rb").read() != cur:
-                    break
+                data = open(nxt, "rb").read()
             except OSError:
                 break
-            depth += 1              # 这层和现在的设置一模一样,退它没意义,继续往下
-        src = _prev_slot_path(path, depth + 1)
-        if not os.path.exists(src):
+            d += 1
+            if data in seen:
+                continue            # 这份内容已经见过了:跳过,不占一层
+            seen.add(data)
+            src, depth = nxt, d
+            break
+        if src is None:
             # ⚠️ 别再用「config(text=...) + after(...)」的老写法:_tick 下一帧
             # 会调 _update_status_label 把它抹掉,提示等于看不见(2026-11-13 修,
             # 和 2026-11-10 F8 提示语一闪就没是同一个坑)。
@@ -3944,13 +4303,13 @@ class SimpleGameTimer(object):
         except OSError:
             self._flash_status("恢复失败")
             return
-        self.cfg.restore_depth = depth + 1
+        self.cfg.restore_depth = depth
         self.cfg.pending_snapshot = True
         self._reload_from_disk()
         # 还原换掉了整份配置(编辑模式可能被 _reload_from_disk 进出过),托盘状态跟着刷
         self._refresh_tray()
         # 层数连同**恢复后**的文件指纹落盘:重启后接着往回退,不用再猜
-        self.cfg.set_restore_depth(depth + 1)
+        self.cfg.set_restore_depth(depth)
         # 2026-10-14 晚用户要求:这句太长,就闪「已恢复」(原「已恢复上次设置」)
         self._flash_status("已恢复")
 
