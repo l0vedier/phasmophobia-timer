@@ -27,7 +27,7 @@ from PIL import Image
 import pystray
 from pynput import keyboard
 from pynput.keyboard import Key
-from pynput.mouse import Listener as MouseListener
+from pynput.mouse import Listener as MouseListener, Controller as MouseController, Button as MouseButton
 
 # 体力条轮询按键状态用(见 _vks_of)。显式声明类型:不写 restype 时 ctypes
 # 默认按 c_int 取返回值,GetAsyncKeyState 返回的是 SHORT。
@@ -174,6 +174,8 @@ HOTKEY_DESCRIPTIONS = [
     ("toggle_stopwatch_view", "切换主显示 / 秒表显示"),
     ("close", "关闭程序"),
     ("toggle_touch", "禁用 / 恢复触摸板(屏)"),
+    ("autoclick_enable", "连点器 激活 / 关闭"),
+    ("autoclick", "连点器 预备 / 取消"),
     ("click_second", "启动第二计时器"),
     ("click_reset", "重置并重开主计时器"),
 ]
@@ -196,6 +198,7 @@ HOTKEY_GROUPS = [
     ("秒表", ("toggle_stopwatch_active", "stopwatch_start", "toggle_stopwatch_view")),
     ("鼠标", ("click_second", "click_reset")),
     ("程序", ("close", "toggle_touch")),
+    ("连点器", ("autoclick_enable", "autoclick")),
 ]
 
 HOTKEY_LABELS = dict(HOTKEY_DESCRIPTIONS)
@@ -373,6 +376,16 @@ DEFAULTS = {
         # 2026-11-09 用户点名「游玩时老是碰到触摸板/屏」:一键临时停用,
         # 退出工具时自动恢复(见 close_program)。默认 F8 —— F7 是体力归满。
         "toggle_touch": "F8",
+        # 2026-11-27 连点器:按一下进「预备」,预备状态下点左键开始连点,再按一次退出。
+        # 2026-11-27:FN 键 = 连点器总开关(激活/关闭),Y 才是"预备"
+        "autoclick_enable": "F10",
+        "autoclick": "Y",
+    },
+    "Autoclick": {
+        # 一次「双击」里两下之间的间隔(毫秒)
+        "click_gap_ms": "40",
+        # 双击与双击之间的间隔(毫秒)
+        "cycle_gap_ms": "60",
     },
     "Stamina": {
         # 1 = 显示体力条浮窗;0 = 隐藏(托盘菜单「显示体力条」改的就是这个)
@@ -1213,6 +1226,27 @@ def spec_to_parts(spec):
 TRANSPARENT_MODS = ("SHIFT",)
 
 
+def real_mods():
+    """直接问系统:CTRL / SHIFT / ALT 此刻到底按下没有。
+
+    为什么不信事件流:Alt+Z(比如 NVIDIA 覆盖层)会把 Alt 的**松开事件**吞掉,
+    监听器以为 Alt 一直按着,之后所有热键都因为"多了一个 ALT"匹配不上 ——
+    用户实测「按了 Alt+Z 以后任何按键都不生效」就是这个。
+    """
+    try:
+        u = ctypes.windll.user32
+        out = set()
+        if u.GetAsyncKeyState(0x11) & 0x8000:      # VK_CONTROL
+            out.add("CTRL")
+        if u.GetAsyncKeyState(0x10) & 0x8000:      # VK_SHIFT
+            out.add("SHIFT")
+        if u.GetAsyncKeyState(0x12) & 0x8000:      # VK_MENU
+            out.add("ALT")
+        return frozenset(out)
+    except Exception:
+        return None
+
+
 def match_hotkey(hotkeys, name, mods):
     """按键名 + 当前按住的修饰键集合,判断该触发哪个动作;没有就返回 None。
 
@@ -1344,6 +1378,16 @@ class SimpleGameTimer(object):
         # 窗口、托盘项、设置分区。整个进程只有一种模式,见模块顶上的 APP_MODE。
         self.mode = _app_mode()
         self._has_timer = self.mode in ("both", "timer")
+        # 2026-11-18 用户要求:托盘右键能「隐藏计时器」(锁屏/录屏时临时收起来)
+        self._timer_shown = True
+        # 2026-11-27 连点器:off / armed(预备) / running(连点中)
+        self._ac_enabled = True      # 托盘「启动连点器」总开关
+        self._ac_state = "off"
+        self._ac_stop = threading.Event()
+        self._ac_thread = None
+        self._ac_emitting = False
+        self._ac_last_emit = 0.0
+        self._ac_hook_tid = None
         self._has_stamina = self.mode in ("both", "stamina")
 
         # 配置住用户目录(与程序文件夹分离);三套各有各的文件(timer.ini /
@@ -1415,6 +1459,7 @@ class SimpleGameTimer(object):
         # 之前只在 _open_hotkey_window 里创建,首次滚轮直接 AttributeError(exe 无控制台,静默)。
         self._tw = {}
         self._tw_file = None
+        self._hotkey_rows = {}
 
         # ---- 计时参数(从配置读,热重载时刷新) ----
         self._load_timer_params()
@@ -2234,6 +2279,7 @@ class SimpleGameTimer(object):
         # ⚠️ 必须在算 delay / 排 after() **之前**调 —— 精度决定这一帧的等待
         # 能醒多准,排完再调就慢了一整帧。
         self._sync_timer_resolution()
+        self._sync_mods()          # 修饰键以系统实际状态为准(防 Alt 松开被吞)
 
         # 配置文件热重载
         try:
@@ -2355,6 +2401,9 @@ class SimpleGameTimer(object):
     def _update_status_label(self):
         # 提示语(_flash_status)没到期之前不许重画,否则 _tick 下一帧就把它抹掉
         if self._flash_until > time.monotonic():
+            return
+        if getattr(self, "_ac_state", "off") == "running":
+            self.status_label.config(text="连点")
             return
         if self._capturing:
             self.status_label.config(text="请按键…")
@@ -2808,6 +2857,15 @@ class SimpleGameTimer(object):
             # 不做全局去重:按住热键不放,系统会持续补发 press 事件,热键就跟着
             # 连发 —— 这是原版行为(原版只有 R 键有 _r_lock,其它键按住连发)。
             # 只有「切换主显示 / 秒表」保留锁,按住只切一次,免得画面疯狂闪烁。
+            real = real_mods()
+            if real is not None:
+                # 以系统实际状态为准:被吞掉的修饰键立刻"松开"
+                self._pressed_mods = set(real)
+                for m in ("CTRL", "SHIFT", "ALT"):
+                    if m in real:
+                        self._down_keys.add(m)
+                    else:
+                        self._down_keys.discard(m)
             action = match_hotkey(self.hotkeys, name, frozenset(self._pressed_mods))
             # 体力条工具没有计时器热键(2026-11-09 拆分):捕获/改键照常,只是
             # 不再把按键派发给计时器动作。WASD/Shift/C/F7 走轮询,不靠这里。
@@ -2825,6 +2883,18 @@ class SimpleGameTimer(object):
         except Exception:
             pass
 
+    def _sync_mods(self):
+        """每帧校正修饰键状态(松开事件被别的程序吞掉时靠这个自愈)。"""
+        real = real_mods()
+        if real is None:
+            return
+        self._pressed_mods = set(real)
+        for m in ("CTRL", "SHIFT", "ALT"):
+            if m in real:
+                self._down_keys.add(m)
+            else:
+                self._down_keys.discard(m)
+
     def _on_key_release(self, key):
         try:
             mod = MODIFIER_KEYS.get(key)
@@ -2840,6 +2910,20 @@ class SimpleGameTimer(object):
             pass
 
     def _on_mouse_click(self, x, y, button, pressed):
+        # 连点器自己发出来的点击不要再喂回监听器(否则会和热键/连点打架)
+        if self._ac_emitting:
+            return
+        # 预备状态下按左键 → 开始连点(这一下本身仍然正常传给游戏)
+        # 连点中:用户点左键 = 停止连点(由低层钩子 _ac_hook_thread 判定,
+        # 这里只把事件挡掉,免得它再触发别的热键)
+        if (getattr(self, "_ac_enabled", True) and self._ac_state == "running"
+                and button == MouseButton.left):
+            return
+        if (pressed and getattr(self, "_ac_enabled", True)
+                and self._ac_state == "armed"
+                and button == MouseButton.left and not self.edit_mode
+                and not self._capturing):
+            self.root.after(0, self._ac_start)
         if not pressed or self.edit_mode:
             # 编辑模式下交给 tkinter 自己处理拖动和右键退出
             return
@@ -2880,6 +2964,8 @@ class SimpleGameTimer(object):
             "toggle_touch": self.toggle_touch,
             "click_second": self.handle_left_click_timer2,
             "click_reset": self.handle_right_click,
+            "autoclick": self.toggle_autoclick,
+            "autoclick_enable": self.toggle_ac_enabled,
         }.get(action)
         if handler:
             handler()
@@ -3091,6 +3177,10 @@ class SimpleGameTimer(object):
         self._update_status_label()
 
     def close_program(self):
+        try:
+            self._ac_stop_now()
+        except Exception:
+            pass
         # ⚠️ 2026-11-09 修幽灵托盘图标:用户「每次打开托盘都发现多个计时器图标」。
         # 根因:pystray 的 stop() **只是 PostMessage(WM_STOP)**,真正的
         # Shell_NotifyIcon(NIM_DELETE) 在托盘消息循环线程的 finally 里跑
@@ -3276,6 +3366,12 @@ class SimpleGameTimer(object):
             pystray.MenuItem("编辑模式", lambda: self._tray_call(self._toggle_edit_mode),
                              checked=lambda item: self.edit_mode),
         ]
+        # 2026-11-18:托盘右键一键隐藏 / 显示计时器本身(程序继续在后台跑)
+        if self._has_timer:
+            items.append(
+                pystray.MenuItem("显示计时器",
+                                 lambda: self._tray_call(self.toggle_timer_visible),
+                                 checked=lambda item: self._timer_shown))
         if self._has_timer:
             # 2026-11-12 用户点名:不用第二计时器时,托盘一个勾把它隐藏 + 停用
             # (窗口跟着缩短,左键 / F2 都不再操作它)。checked 和别的勾一样是
@@ -3286,6 +3382,17 @@ class SimpleGameTimer(object):
                                  checked=lambda item: self._timer2_visible))
         # 2026-11-16 用户要求:体力条的设置全部删掉 —— 托盘不再有「显示体力条」,
         # 体力弧始终显示(固定默认尺寸)。
+        if self._has_timer and self._has_stamina:
+            items.append(
+                pystray.MenuItem("显示体力条",
+                                 lambda: self._tray_call(self._toggle_stamina),
+                                 checked=lambda item: bool(self.cfg.get_int("Stamina", "enabled"))))
+        # 2026-11-27 连点器总开关(放在「显示体力条」后面)
+        if self._has_timer:
+            items.append(
+                pystray.MenuItem("启动连点器",
+                                 lambda: self._tray_call(self.toggle_ac_enabled),
+                                 checked=lambda item: self._ac_enabled))
         # 2026-11-09 用户点名:玩游戏时老是误碰触摸板/屏,要能临时关掉再开回来。
         # 只做进二合一(用户点名「只需要做工具的,其他的不用增加这个功能」)。
         # checked 和别的勾一样是**重建菜单时**求值,toggle 完要 _refresh_tray。
@@ -3345,6 +3452,159 @@ class SimpleGameTimer(object):
             self.time_label2.config(text="00:00")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # 连点器(2026-11-27)
+    # ------------------------------------------------------------------
+    def toggle_ac_enabled(self):
+        """托盘「启动连点器」:取消勾 = 连点器完全失效(Y 也不响应)。"""
+        self._ac_enabled = not self._ac_enabled
+        if not self._ac_enabled:
+            self._ac_stop_now()
+            self._ac_state = "off"
+            self._flash_status("已关闭")
+        else:
+            self._flash_status("已激活")
+        self._refresh_tray()
+
+    def toggle_autoclick(self):
+        """热键:off → armed(预备) → off。连点中按一下也是取消。"""
+        if not self._ac_enabled:
+            return
+        if self._ac_state == "off":
+            self._ac_state = "armed"
+            self._flash_status("预备")
+        else:
+            self._ac_stop_now()
+            self._ac_state = "off"
+            self._flash_status("取消")
+        self._refresh_tray()
+
+    def _ac_start(self):
+        if self._ac_state != "armed":
+            return
+        self._ac_state = "running"
+        self._ac_stop.clear()
+        # 进入连点:"预备"那条闪文要立刻让位给常驻的「连点」
+        self._flash_until = 0.0
+        self._update_status_label()
+        self._ac_thread = threading.Thread(target=self._ac_loop, daemon=True)
+        self._ac_thread.start()
+        # 低层鼠标钩子:只干一件事 —— 分辨"人手点的左键",据此停止连点。
+        # pynput 拿不到 LLMHF_INJECTED 标志,所以自己挂一个 WH_MOUSE_LL。
+        self._ac_hook_tid = None
+        threading.Thread(target=self._ac_hook_thread, daemon=True).start()
+        self._refresh_tray()
+
+    def _ac_hook_thread(self):
+        """WH_MOUSE_LL:人手按下的左键 → 停止连点;注入的(连点自己发的)不算。"""
+        import ctypes
+        from ctypes import wintypes
+
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                      wintypes.WPARAM, wintypes.LPARAM)
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        try:
+            self._ac_hook_tid = k.GetCurrentThreadId()
+        except Exception:
+            return
+
+        def proc(nCode, wParam, lParam):
+            try:
+                if nCode == 0 and wParam == 0x0201:        # WM_LBUTTONDOWN
+                    info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                    if not (info.flags & 0x01):            # 0x01 = LLMHF_INJECTED
+                        self.root.after(0, self._ac_user_stop)
+            except Exception:
+                pass
+            return u.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._ac_hook_proc = HOOKPROC(proc)                # 必须留引用,否则被回收
+        h = u.SetWindowsHookExW(14, self._ac_hook_proc, None, 0)   # 14 = WH_MOUSE_LL
+        if not h:
+            return
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+        try:
+            u.UnhookWindowsHookEx(h)
+        except Exception:
+            pass
+
+    def _ac_user_stop(self):
+        """用户自己点一下左键 → 停掉连点(回到 off)。"""
+        if self._ac_state != "running":
+            return
+        self._ac_stop_now()
+        self._flash_status("取消")
+        self._refresh_tray()
+
+    def _ac_stop_now(self):
+        self._ac_stop.set()
+        tid = getattr(self, "_ac_hook_tid", None)
+        if tid:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        self._ac_state = "off"
+        t = self._ac_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1.0)
+        self._ac_thread = None
+
+    def _ac_loop(self):
+        """双击 → 停 → 双击 …直到被叫停。间隔全部读配置,可以手改。"""
+        try:
+            gap = max(5, self.cfg.get_int("Autoclick", "click_gap_ms")) / 1000.0
+        except Exception:
+            gap = 0.04
+        try:
+            cycle = max(5, self.cfg.get_int("Autoclick", "cycle_gap_ms")) / 1000.0
+        except Exception:
+            cycle = 0.06
+        m = MouseController()
+        while not self._ac_stop.is_set():
+            self._ac_emitting = True
+            try:
+                for _ in range(2):
+                    self._ac_last_emit = time.time()
+                    m.press(MouseButton.left)
+                    time.sleep(gap)
+                    self._ac_last_emit = time.time()
+                    m.release(MouseButton.left)
+                    time.sleep(gap)
+            except Exception:
+                pass
+            finally:
+                self._ac_emitting = False
+            if self._ac_stop.wait(cycle):
+                break
+
+    def toggle_timer_visible(self):
+        """托盘「显示计时器」:取消勾 = 隐藏整个计时器窗口(程序照常在后台跑)。"""
+        if not self._has_timer:
+            return
+        self._timer_shown = not self._timer_shown
+        try:
+            if self._timer_shown:
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+                self._relayout()
+            else:
+                if self.edit_mode:
+                    self._exit_edit_mode(save=False)
+                self.root.withdraw()
+        except tk.TclError:
+            pass
+        self._refresh_tray()
 
     def toggle_timer2(self):
         """托盘「显示第二计时器」:取消勾 = 隐藏 + 停用。
@@ -3517,42 +3777,35 @@ class SimpleGameTimer(object):
         # 无边框窗口:系统标题栏、关闭按钮、窗口阴影全都没有,全得自己画。
         # win 自己的底色当 1px 外框,body 再缩进 1px —— 不留这一圈描边的话,
         # 24 号灰贴在同为深色的桌面上会糊成一片,看不出窗口边界在哪。
+        # 2026-11-27 用户要求:设置窗口当**普通窗口**用 —— 有系统标题栏、不置顶,
+        # 点到别的窗口就自动最小化(能最小化到任务栏的前提:不再设 TOOLWINDOW)。
         win = tk.Toplevel(self.root)
         self._hotkey_win = win
         win.title("设置")
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=HK_BORDER)
-        _no_taskbar(win)        # 设置窗口也别占任务栏(2026-11-15 用户点名)
+        win.configure(bg=HK_BG)
+        win.resizable(False, False)
 
         body = tk.Frame(win, bg=HK_BG)
-        body.pack(fill="both", expand=True, padx=1, pady=1)
+        body.pack(fill="both", expand=True)
 
-        # ---- 自绘标题栏(整条都能拖) ----
-        titlebar = tk.Frame(body, bg=HK_BG)
-        titlebar.pack(fill="x")
-        title = tk.Label(titlebar, text="设置", bg=HK_BG, fg=HK_TEXT,
-                         font=(FONT_FAMILY_STATUS, 10, "bold"))
-        title.pack(side="left", padx=(14, 0), pady=(10, 9))
-        close = tk.Label(titlebar, text="×", bg=HK_BG, fg=HK_DIM, cursor="hand2",
-                         font=(FONT_FAMILY_STATUS, 13))
-        close.pack(side="right", padx=(0, 10), pady=(4, 4))
-        close.bind("<Button-1>", lambda e: self._close_hotkey_window())
-        close.bind("<Enter>", lambda e: close.config(fg=HK_CLOSE_HOVER))
-        close.bind("<Leave>", lambda e: close.config(fg=HK_DIM))
+        def _focus_watch(_ev=None):
+            def check():
+                try:
+                    if not win.winfo_exists():
+                        return
+                    # 用系统前台窗口判断,比 focus_get() 可靠:焦点跑到别的程序时
+                    # focus_get() 可能仍返回本窗口里的控件。
+                    frame = int(win.wm_frame(), 16)
+                    fg = ctypes.windll.user32.GetForegroundWindow()
+                    root_hwnd = ctypes.windll.user32.GetAncestor(fg, 2)  # GA_ROOT
+                    if fg in (frame, root_hwnd):
+                        return
+                    win.iconify()
+                except Exception:
+                    pass
+            win.after(150, check)
 
-        def drag_start(ev):
-            win._drag = (ev.x_root - win.winfo_x(), ev.y_root - win.winfo_y())
-
-        def drag_move(ev):
-            dx, dy = getattr(win, "_drag", (0, 0))
-            win.geometry("+{}+{}".format(ev.x_root - dx, ev.y_root - dy))
-
-        for w in (titlebar, title):
-            w.bind("<Button-1>", drag_start)
-            w.bind("<B1-Motion>", drag_move)
-
-        tk.Frame(body, bg=HK_BORDER, height=1).pack(fill="x")
+        win.bind("<FocusOut>", _focus_watch)
         hint = tk.Label(body, text="点一行选中,再按下希望改成的新键", bg=HK_BG, fg=HK_DIM,
                         font=(FONT_FAMILY_STATUS, 9))
         hint.pack(anchor="w", padx=15, pady=(10, 0))
@@ -3567,18 +3820,11 @@ class SimpleGameTimer(object):
             tk.Label(body, text=txt, bg=HK_BG, fg=HK_DIM,
                      font=(FONT_FAMILY_STATUS, 9)).pack(anchor="w", padx=15, pady=(12, 3))
 
-        # 2026-11-09 三套拆分:设置窗口按模式裁分区 —— 计时器工具没有「体力条」,
-        # 体力条工具只留「体力条」三行(归满键 / 大小 / 长度,用户定),没有外观、
-        # 计时、热键。_tw / _hotkey_rows 只在建行时用到,没建的行刷新时自然跳过。
+        # 2026-11-27 用户指定分组:主计时器 / 第二计时器 / 秒表 / 连点器 / 外观 / 程序。
+        # 热键不再在这里显示(改键走托盘/热键本身)。
         if self._has_timer:
             sec_header("外观")
             self._build_tweak_row(body, {
-                # 2026-10-15 用户点名:四行参数统一改成**可输入** —— 输入时只打数字,
-                # 提交后程序自动补单位(「200」→「200秒」),数字和单位是同一段文本、
-                # 同一个颜色;用户自己打的单位会被剥掉、强制换成程序单位
-                # (机制见 _build_tweak_row 的 commit)。
-                # ⚠️ 「点值恢复默认」由此**整体退休**(点击 = 落光标编辑,冲突);
-                # 要回默认值直接在框里输,大回退还留着「恢复上次设置」兜底。
                 "key": "opacity", "field": "窗口透明度", "unit": "%",
     "lo": 10, "hi": 100,
                 "val": lambda: int(round(self.cfg.get_float("Display", "opacity") * 100)),
@@ -3586,11 +3832,6 @@ class SimpleGameTimer(object):
                 "set": lambda v: self._set_opacity(v / 100.0),
             })
             self._build_tweak_row(body, {
-                # ⚠️ config 里仍是三个字号键(font_size / timer2_font_size /
-                # status_font_size),比例锁死、永远一起动(见 _bump_font);
-                # 界面上**合成一行**就够了 —— 2026-10-14 用户点名:三个字号其实
-                # 是一个东西,就放一个「计时器字号」,不用多放。别再拆回三行。
-                # 输入框里键入的是**主字号**,差值应用到三个键(见 _set_font)。
                 "key": "font_size", "field": "计时器字号", "unit": "",
     "lo": 8, "hi": 200,
                 "val": lambda: self.cfg.get_int("Display", "font_size"),
@@ -3598,11 +3839,8 @@ class SimpleGameTimer(object):
                 "set": lambda v: self._set_font(v),
             })
 
-            sec_header("计时")
+            sec_header("主计时器")
             self._build_tweak_row(body, {
-                # 上/下限:1~9 分钟。主计时器归零会自动重开(见 _tick),
-                # 调这个就是调滚屏归零的周期。输入框里键入的数字按**分钟**算
-                # (行上写的什么单位,输进去的就是什么单位)。
                 "key": "main_max", "field": "主计时器上限", "unit": "分钟",
     "lo": 1, "hi": 9,
                 "val": lambda: self.cfg.get_int("Timer", "main_max") // 60,
@@ -3610,9 +3848,14 @@ class SimpleGameTimer(object):
                                                   max(60, min(540, self.cfg.get_int("Timer", "main_max") + d * 60))),
                 "set": lambda v: self._tweak_set("Timer", "main_max", v * 60),
             })
+            self._build_hotkey_rows(body, ("toggle_active", "pause_resume", "click_reset"))
+
+            sec_header("第二计时器")
+            self._build_timer2_toggle_row(body)
+            self._build_hotkey_rows(body, ("reset_second", "click_second"))
+
+            sec_header("秒表")
             self._build_tweak_row(body, {
-                # 2026-10-15 用户点名:①单位用**秒**(旧:分钟);②可输入。
-                # 范围 10 秒~1 小时,输入超范围自动卡到边界;−/+ 步长 ±30 秒。
                 "key": "stopwatch_max", "field": "秒表上限", "unit": "秒",
     "lo": 10, "hi": 3600,
                 "val": lambda: self.cfg.get_int("Timer", "stopwatch_max"),
@@ -3620,25 +3863,45 @@ class SimpleGameTimer(object):
                                                   max(10, min(3600, self.cfg.get_int("Timer", "stopwatch_max") + d * 30))),
                 "set": lambda v: self._tweak_set("Timer", "stopwatch_max", v),
             })
+            self._build_hotkey_rows(body, ("toggle_stopwatch_active", "stopwatch_start",
+                                           "toggle_stopwatch_view"))
 
-        self._hotkey_rows = {}
-        # 2026-11-16 用户要求:体力条的设置项(归满键 / 大小 / 长度)整段删掉。
-        # 体力条本身保留 —— 固定用默认尺寸,归满键仍是出厂 F7。
-        if self._has_timer:
-            sec_header("热键")
-            rows = tk.Frame(body, bg=HK_BG)
-            rows.pack(fill="both", expand=True)
-            for caption, actions in groups:
-                tk.Label(rows, text=caption, bg=HK_BG, fg=HK_DIM,
-                         font=(FONT_FAMILY_STATUS, 9)).pack(anchor="w", padx=15, pady=(9, 3))
-                for action in actions:
-                    self._build_hotkey_row(rows, action)
+            sec_header("连点器")
+            self._build_tweak_row(body, {
+                "key": "ac_click_gap", "field": "双击内间隔", "unit": "毫秒",
+    "lo": 5, "hi": 500,
+                "val": lambda: self.cfg.get_int("Autoclick", "click_gap_ms"),
+                "step": lambda d: self._tweak_set("Autoclick", "click_gap_ms",
+                                                  max(5, min(500, self.cfg.get_int("Autoclick", "click_gap_ms") + d * 5))),
+                "set": lambda v: self._tweak_set("Autoclick", "click_gap_ms", v),
+            })
+            self._build_tweak_row(body, {
+                "key": "ac_cycle_gap", "field": "双击间隔", "unit": "毫秒",
+    "lo": 5, "hi": 1000,
+                "val": lambda: self.cfg.get_int("Autoclick", "cycle_gap_ms"),
+                "step": lambda d: self._tweak_set("Autoclick", "cycle_gap_ms",
+                                                  max(5, min(1000, self.cfg.get_int("Autoclick", "cycle_gap_ms") + d * 10))),
+                "set": lambda v: self._tweak_set("Autoclick", "cycle_gap_ms", v),
+            })
+            self._build_hotkey_rows(body, ("autoclick_enable", "autoclick"))
+
+            if self._has_stamina:
+                sec_header("体力条")
+                self._build_stamina_toggle_row(body)
+
+            sec_header("程序")
+            _proc_hotkeys = ["close"]
+            if self.mode == "both":
+                _proc_hotkeys.append("toggle_touch")
+            self._build_hotkey_rows(body, tuple(_proc_hotkeys))
+            tk.Label(body, text="恐鬼症工具 · 本机版",
+                     bg=HK_BG, fg=HK_DIM,
+                     font=(FONT_FAMILY_STATUS, 9)).pack(anchor="w", padx=15, pady=(2, 8))
+
         else:
-            # 纯体力条工具(2026-11-09 拆分,用户点名「体力条也要一个快速关闭的
-            # 键,先跟计时器一样 F6」):没有计时器热键,只留「关闭程序」这一行。
-            # 键名和计时器共用 [Hotkeys] close,只是写在 stamina.ini 里,两边独立。
-            sec_header("热键")
-            self._build_hotkey_row(body, "close")
+            # 纯体力条工具:没有计时器/连点器,只留「程序」里的关闭热键
+            sec_header("程序")
+            self._build_hotkey_rows(body, ("close",))
 
         tk.Frame(body, bg=HK_BORDER, height=1).pack(fill="x", pady=(9, 0))
         self._hotkey_hint = tk.StringVar(value="")
@@ -3664,6 +3927,46 @@ class SimpleGameTimer(object):
         # 无边框也拦一下 Alt+F4:不拦的话窗口被系统直接销毁,self._capturing
         # 和高亮状态会留在半路(要等 8 秒超时自己清)
         win.protocol("WM_DELETE_WINDOW", self._close_hotkey_window)
+
+    def _build_hotkey_rows(self, parent, actions):
+        """在当前分区下面挂若干改键行(和托盘/热键是同一套配置)。"""
+        for action in actions:
+            if action in self._hotkey_rows:
+                continue
+            self._build_hotkey_row(parent, action)
+
+    def _build_stamina_toggle_row(self, parent):
+        """「显示体力条」勾选行 —— 和托盘那一项是同一个开关(体力条没有可改的键)。"""
+        row = tk.Frame(parent, bg=HK_BG)
+        row.pack(fill="x", padx=15, pady=(2, 4))
+        var = tk.BooleanVar(value=bool(self.cfg.get_int("Stamina", "enabled")))
+        cb = tk.Checkbutton(row, text="显示体力条", variable=var,
+                            bg=HK_BG, fg=HK_TEXT, selectcolor=HK_BG,
+                            activebackground=HK_BG, activeforeground=HK_TEXT,
+                            font=(FONT_FAMILY_STATUS, 10), bd=0,
+                            highlightthickness=0, command=self._on_stamina_check)
+        cb.pack(anchor="w")
+
+    def _on_stamina_check(self):
+        self._toggle_stamina()
+        self._refresh_tray()
+
+    def _build_timer2_toggle_row(self, parent):
+        """「显示第二计时器」勾选行 —— 和托盘那一项是同一个开关。"""
+        row = tk.Frame(parent, bg=HK_BG)
+        row.pack(fill="x", padx=15, pady=(2, 4))
+        var = tk.BooleanVar(value=bool(self._timer2_visible))
+        cb = tk.Checkbutton(row, text="显示第二计时器", variable=var,
+                            bg=HK_BG, fg=HK_TEXT, selectcolor=HK_BG,
+                            activebackground=HK_BG, activeforeground=HK_TEXT,
+                            font=(FONT_FAMILY_STATUS, 10), bd=0,
+                            highlightthickness=0,
+                            command=self._on_timer2_check)
+        cb.pack(anchor="w")
+
+    def _on_timer2_check(self):
+        self.toggle_timer2()
+        self._refresh_tray()
 
     def _tweak_flash(self, msg):
         """操作反馈:把提示写进窗口底部那行小字,1.8 秒后自己消失。
